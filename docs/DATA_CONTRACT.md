@@ -57,10 +57,10 @@
 ## 2. `data/trades.tsv` 交易台账
 
 **唯一真相源。** 所有绩效统计、纪律验证、复盘数字都从这里来。
-制表符分隔,10 列,顺序固定。
+制表符分隔,10–11 列,顺序固定(第 11 列 `rule_ids` 可省略)。
 
 ```
-date	checkpoint	symbol	side	qty	price	amount	reason_tag	pct_of_position	note
+date	checkpoint	symbol	side	qty	price	amount	reason_tag	pct_of_position	note	rule_ids
 ```
 
 | 列 | 类型 | 说明 |
@@ -75,6 +75,7 @@ date	checkpoint	symbol	side	qty	price	amount	reason_tag	pct_of_position	note
 | `reason_tag` | 枚举 | 见下方词表。**买卖标签不通用**,写错会报错 |
 | `pct_of_position` | 小数或空 | 本笔占该仓位当时市值的 %。空值写 `-` |
 | `note` | 自由文本 | 建议记下单时报价(用于估算滑点) |
+| `rule_ids` | 分号分隔,**可省略** | 本笔依据了 `config/rules.toml` 的哪几条规则。第 11 列,旧台账(10 列)仍可读 |
 
 ### `reason_tag` 词表
 
@@ -104,6 +105,16 @@ date	checkpoint	symbol	side	qty	price	amount	reason_tag	pct_of_position	note
   失败时报出**行号**。
 - **不要为了让脚本跑过就删行。** 台账缺一笔,整段历史的 FIFO 配对都会错。
   用 `get_pnl_trade_history` / `get_equity_orders` 回补。
+
+### 样本量从哪来(容易误解)
+
+审计里的"决策事件数"来自**台账**,不是来自规则的 `evidence` 行数。
+
+- 往 `evidence` 追加 20 条文字**不会**让样本数变成 20 —— 那只是叙事记录。
+- `tag_compare` 的样本 = 台账里带相应 `reason_tag` 的**卖出笔数**(一笔卖出 = 一次退出决策)。
+- 所以"规则要多久才够样本"取决于**你实际交易的频率**,不取决于你写了多少反思。
+
+`rule_ids` 列让"这笔是依据哪条规则做的"可被追溯,是更细粒度归因的基础。
 
 ### 统计口径
 

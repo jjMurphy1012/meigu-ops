@@ -29,8 +29,12 @@
 
 状态机(market 类,由 review 推进,**每次状态变更都需要用户批准**)
 ==================================================================
-    hypothesis ──数据支持──► supported ──数据推翻──► refuted ──► retired
-        └──────────────数据推翻──────────────┘
+    hypothesis ──弱支持──► provisional ──数据支持──► supported
+        └────────────────数据推翻────────────────► refuted ──► retired
+
+    ★ 状态**只能由用户批准变更**(`--set-status --approved`)。审计只产生建议。
+      仓位尺寸由 status 决定,不由审计结果决定 —— 否则"需要批准"形同虚设:
+      攒够样本就自动满额,用户从未同意过。
 
 执行层级(与状态正交)
 =====================
@@ -73,7 +77,8 @@ WEAK = "weak"
 MODERATE = "moderate"
 STRONG = "strong"
 
-VALID_STATUS = ("invariant", "enforced", "hypothesis", "supported", "refuted", "retired")
+VALID_STATUS = ("invariant", "enforced", "hypothesis", "provisional",
+                "supported", "refuted", "retired")
 VALID_KIND = ("process", "market")
 VALID_TEST_TYPES = ("enforced_by", "tag_compare", "manual")
 VALID_SCOPE = ("live", "observe", "none")
@@ -88,6 +93,7 @@ SCOPE_BY_STATUS = {
     "enforced": "live",
     "supported": "live",
     "hypothesis": "observe",
+    "provisional": "live",
     "refuted": "none",
     "retired": "none",
 }
@@ -469,7 +475,42 @@ def _value_span(block: str, key: str) -> tuple[int, int]:
 
 
 def _toml_str(s: str) -> str:
-    return '"' + s.replace("\\", "\\\\").replace('"', '\\"') + '"'
+    """TOML 基本字符串。换行/制表符必须转义 —— 直接写进去会让文件立刻损坏。"""
+    return (
+        '"'
+        + s.replace("\\", "\\\\")
+        .replace('"', '\\"')
+        .replace("\n", "\\n")
+        .replace("\r", "\\r")
+        .replace("\t", "\\t")
+        + '"'
+    )
+
+
+def _atomic_write(path: Path, text: str) -> None:
+    """先写临时文件 → 完整解析校验 → 原子替换。校验失败则原文件纹丝不动。
+
+    自我进化闭环会反复改这个文件。一次写坏就会让整套审计**静默失真** ——
+    你会以为规则被检验过,其实文件已经读不出来了。所以每次写入都必须能回滚。
+    """
+    import os
+    import tempfile
+
+    fd, tmp = tempfile.mkstemp(dir=str(path.parent), suffix=".toml.tmp")
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as fh:
+            fh.write(text)
+        # 校验:能解析 + 能通过全部规则校验(标签/闸门/状态一致性)
+        load_rules(path=Path(tmp))
+        os.replace(tmp, path)
+    except Exception as exc:                      # noqa: BLE001
+        try:
+            os.unlink(tmp)
+        except OSError:
+            pass
+        raise ConfigError(
+            f"写入会让 {rel_to_root(path)} 变成非法状态,已回滚(原文件未改动):\n  {exc}"
+        ) from exc
 
 
 def record_evidence(rule_id: str, text: str, path: Path | None = None) -> str:
@@ -489,7 +530,7 @@ def record_evidence(rule_id: str, text: str, path: Path | None = None) -> str:
         new_val = f"[{inner}{sep} {_toml_str(text)}]"
 
     updated = block[:vs] + new_val + block[ve:]
-    path.write_text(raw[:bs] + updated + raw[be:], encoding="utf-8")
+    _atomic_write(path, raw[:bs] + updated + raw[be:])
     return f"已为 {rule_id} 追加一条证据"
 
 
@@ -507,13 +548,20 @@ def set_status(rule_id: str, status: str, note: str = "",
     old = block[vs:ve].strip().strip('"')
     block = block[:vs] + _toml_str(status) + block[ve:]
 
-    # 降级为 refuted/retired 时同步停用,避免"状态说停用、作用域还在跑"
-    if status in ("refuted", "retired"):
-        try:
-            svs, sve = _value_span(block, "execution_scope")
-            block = block[:svs] + _toml_str("none") + block[sve:]
-        except ConfigError:
-            block = block.rstrip("\n") + '\nexecution_scope = "none"\n'
+    # 状态与作用域必须同步,两个方向都要:
+    #   降级 → 停用(否则"状态说停用、作用域还在跑")
+    #   重新启用 → 清掉遗留的 none(否则 refuted→supported 后规则仍然用不了)
+    want_scope = "none" if status in ("refuted", "retired") else ""
+    try:
+        svs, sve = _value_span(block, "execution_scope")
+        if want_scope:
+            block = block[:svs] + _toml_str(want_scope) + block[sve:]
+        else:
+            # 清空 = 回到"按 status 推导",避免旧的 none 卡住已恢复的规则
+            block = block[:svs] + '""' + block[sve:]
+    except ConfigError:
+        if want_scope:
+            block = block.rstrip("\n") + f'\nexecution_scope = {_toml_str(want_scope)}\n'
 
     try:
         avs, ave = _value_span(block, "last_audited")
@@ -521,7 +569,7 @@ def set_status(rule_id: str, status: str, note: str = "",
     except ConfigError:
         pass
 
-    path.write_text(raw[:bs] + block + raw[be:], encoding="utf-8")
+    _atomic_write(path, raw[:bs] + block + raw[be:])
     msg = f"{rule_id}: {old} → {status}"
     if note:
         record_evidence(rule_id, f"[{today_et().isoformat()}] {old}→{status}: {note}", path)
@@ -539,6 +587,8 @@ def add_rule(rule_id: str, statement: str, kind: str = "market",
     except ConfigError as exc:
         if "已存在" in str(exc):
             raise
+    if kind not in VALID_KIND:
+        raise ConfigError(f"kind 必须是 {'/'.join(VALID_KIND)},实际 {kind!r}")
     test_line = test or '{ type = "manual", how = "复盘时人工核查(待补:怎么查)" }'
     block = f"""
 
@@ -551,7 +601,7 @@ status    = "hypothesis"
 evidence  = []
 last_audited = ""
 """
-    path.write_text(raw.rstrip("\n") + block, encoding="utf-8")
+    _atomic_write(path, raw.rstrip("\n") + block)
     return f"已新增 {rule_id}(hypothesis → observe,尺寸按最低档)"
 
 

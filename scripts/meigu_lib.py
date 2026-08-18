@@ -7,7 +7,7 @@ from __future__ import annotations
 
 import datetime as dt
 import tomllib
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parent.parent
@@ -137,7 +137,11 @@ TRADE_COLUMNS = (
     "reason_tag",
     "pct_of_position",
     "note",
+    "rule_ids",     # 可选第 11 列:本笔依据了 config/rules.toml 的哪几条规则(分号分隔)
 )
+
+# 第 11 列是后加的。旧台账只有 10 列,必须继续可读 —— 否则升级会让历史数据失效。
+MIN_TRADE_COLUMNS = 10
 
 
 class ConfigError(RuntimeError):
@@ -340,6 +344,7 @@ class Trade:
     reason_tag: str
     pct_of_position: float | None
     note: str
+    rule_ids: list[str] = field(default_factory=list)
 
 
 def _parse_float(raw: str, field: str, line_no: int) -> float:
@@ -370,11 +375,13 @@ def parse_trades(path: Path = TRADES_TSV, vocab: Vocabulary | None = None) -> li
         cells = line.split("\t")
         if cells[0].strip() == "date":  # 表头
             continue
-        if len(cells) != len(TRADE_COLUMNS):
+        if not MIN_TRADE_COLUMNS <= len(cells) <= len(TRADE_COLUMNS):
             raise LedgerError(
-                f"第 {line_no} 行:应有 {len(TRADE_COLUMNS)} 个制表符分隔字段,"
-                f"实际 {len(cells)} 个。字段顺序:{'/'.join(TRADE_COLUMNS)}"
+                f"第 {line_no} 行:应有 {MIN_TRADE_COLUMNS}-{len(TRADE_COLUMNS)} 个"
+                f"制表符分隔字段,实际 {len(cells)} 个。"
+                f"字段顺序:{'/'.join(TRADE_COLUMNS)}(最后一列 rule_ids 可省略)"
             )
+        cells = cells + [""] * (len(TRADE_COLUMNS) - len(cells))
 
         (
             date_s,
@@ -387,6 +394,7 @@ def parse_trades(path: Path = TRADES_TSV, vocab: Vocabulary | None = None) -> li
             reason_tag,
             pct_s,
             note,
+            rule_ids_s,
         ) = (c.strip() for c in cells)
 
         try:
@@ -427,6 +435,7 @@ def parse_trades(path: Path = TRADES_TSV, vocab: Vocabulary | None = None) -> li
                     _parse_float(pct_s, "pct_of_position", line_no) if pct_s and pct_s != "-" else None
                 ),
                 note=note,
+                rule_ids=[x.strip() for x in rule_ids_s.split(";") if x.strip()],
             )
         )
 

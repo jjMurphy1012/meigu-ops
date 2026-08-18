@@ -12,7 +12,7 @@
 <p align="center">
   <img src="https://img.shields.io/badge/Python-3.11+-3776AB?style=flat&logo=python&logoColor=white" alt="Python 3.11+">
   <img src="https://img.shields.io/badge/dependencies-none-2ea44f?style=flat" alt="Zero dependencies">
-  <img src="https://img.shields.io/badge/tests-261%20passing-2ea44f?style=flat" alt="261 tests">
+  <img src="https://img.shields.io/badge/tests-274%20passing-2ea44f?style=flat" alt="274 tests">
   <a href="https://claude.com/claude-code"><img src="https://img.shields.io/badge/Built_with-Claude_Code-000?style=flat&logo=anthropic&logoColor=white" alt="Built with Claude Code"></a>
   <img src="https://img.shields.io/badge/License-MIT-blue.svg" alt="MIT">
   <a href="DISCLAIMER.md"><img src="https://img.shields.io/badge/%E2%9A%A0%EF%B8%8F-%E4%B8%8D%E6%9E%84%E6%88%90%E6%8A%95%E8%B5%84%E5%BB%BA%E8%AE%AE-critical" alt="Not investment advice"></a>
@@ -46,6 +46,30 @@
      ▲                                                     │
      └────────── 升级 / 降级 / 退役(需你批准)◄───────────┘
 ```
+
+## 我为什么做这个
+
+2026 年 6 月，我在一次财报爆表的次日开盘一次性满仓追进当时最热的主线。
+接下来两周，市场把那一轮涨幅原样还了回来。
+
+有意思的是后面发生的事：靠几条很朴素的纪律——在反弹里减而不是在下跌里割、
+先砍最弱的一环、在已知的二元事件前把现金提上来——我把损失控制在个位数百分比，
+同期我持仓所在的板块指数跌了 7% 以上。
+
+**问题是那几条纪律只存在于我脑子里。** 而脑子会忘、会侥幸、会在连续第 20 天
+盯盘之后变得懈怠。更糟的是，一个月后我自己复盘时发现了相反的毛病：
+同一套"谨慎"让我在该出手的时候反复等待，现金长期空转——
+那笔亏损同样真实，只是它不出现在盈亏表里。
+
+两个方向的失败让我确认了一件事：**问题不在于我的规则对不对，
+而在于我没有任何机制去知道它们对不对。**
+
+于是有了这个项目。它把纪律从脑子里搬进文件，把机械的检查从自觉搬进程序，
+最后——也是最花时间的一部分——把"这条规则到底成不成立"变成一个能被台账数据
+回答的问题，而不是一个凭印象争论的问题。
+
+> 你在这个仓库里找不到我的那几条纪律。它们对你没有意义，
+> 而且我自己也在不断修正它们。**留下的是那套让纪律能被检验、能被推翻的机制。**
 
 ## 它做什么
 
@@ -92,7 +116,7 @@ cp config/rules.example.toml        config/rules.toml         # 可检验的规�
 
 make doctor        # 环境自检
 make rules-check   # 规则格式 / 标签引用 / 闸门引用
-make test          # 261 个测试
+make test          # 274 个测试
 make report        # 生成当日日报骨架
 ```
 
@@ -115,6 +139,27 @@ make report        # 生成当日日报骨架
 | `make trading-day` | 交易日 / 半日市 / 上下一交易日 | 观察日顺延、耶稣受难日人算会错,错一次毁一天 |
 | `make journal-check` | 日志结构:标题 / 倒序 / 孤儿段落 / 行数 | `Edit` 返回成功 ≠ 文档结构对了 |
 | `make check-privacy` | 提交前隐私检查 | 人会忘,而这个错误不可逆 |
+
+## 关于"全自动"的边界
+
+把 `config/profile.toml` 的 `[execution]` 三个开关打开，意味着：
+
+✅ **agent 在一次运行中可以真的下单**，无需逐笔确认
+✅ 每笔仍必经 `preflight`，四条硬上限与 kill switch 无条件生效
+✅ 仓位按证据强度自动缩放，无需人工换算
+
+**它不意味着以下任何一条**（这些是当前的真实缺口）：
+
+❌ 五个检查点已被安装成**持久调度**——目前依赖会话级 cron，CLI 退出即丢，
+   需要盘前自愈重建。仓库尚无 `scheduler install/status` 之类的命令
+❌ agent **无法绕过** `preflight` 直接调用券商 MCP——这一层只能靠
+   `.claude/settings.local.json` 的权限白名单和流程约束，仓库内无法强制
+❌ 成交结果自动回写台账并驱动审计——记台账仍是 `journal` mode 的动作
+
+所以现阶段准确的说法是**「有人在场的自动化」**：你需要保持会话存活，
+而系统负责让每一笔决策都过一遍确定性闸门、并把证据攒进规则里。
+
+真正的无人值守还需要持久调度器与唯一下单网关——那是下一阶段的工作。
 
 ## 数据边界
 

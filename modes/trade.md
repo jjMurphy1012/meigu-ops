@@ -122,7 +122,7 @@ place_equity_order(..., ref_id=<全新 UUID>)
 **必须用 `config/reason-tags.toml` 里定义的值**,不要自创、不要沿用文档里的示例标签。
 
 ```
-date	checkpoint	symbol	side	qty	price	amount	reason_tag	pct_of_position	note
+date	checkpoint	symbol	side	qty	price	amount	reason_tag	pct_of_position	note	rule_ids
 ```
 
 追加后跑一次校验:

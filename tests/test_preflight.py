@@ -209,9 +209,24 @@ class TestFreshness(unittest.TestCase):
 
 
 class TestSize(unittest.TestCase):
-    def test_over_single_order_cap_denies(self):
-        r = run(order(amount_usd=150.0, position={"market_value": 400.0}), cfg(), NOON, vocab=TEST_VOCAB)
+    def test_buy_over_single_order_cap_denies(self):
+        r = run(order(side="buy", reason_tag="建仓", amount_usd=150.0,
+                      portfolio={"buying_power": 2000.0, "total_value": 5000.0},
+                      position={"market_value": 400.0}), cfg(), NOON, vocab=TEST_VOCAB)
         self.assertIn("单笔金额上限", names_failed(r))
+
+    def test_sell_is_not_capped_by_max_order_usd(self):
+        """★ 退出敞口不受单笔上限约束 —— 否则会变成"能建仓、不能完整平仓"。"""
+        r = run(order(amount_usd=120.0, intent="close",
+                      position={"market_value": 120.0}), cfg(), NOON, vocab=TEST_VOCAB)
+        self.assertNotIn("退出尺寸上限", names_failed(r))
+        self.assertNotIn("单笔金额上限", {c.name for c in r.checks})
+        self.assertEqual(r.verdict, ALLOW, [c.detail for c in r.blockers])
+
+    def test_sell_beyond_position_value_denies(self):
+        r = run(order(amount_usd=500.0, intent="close",
+                      position={"market_value": 120.0}), cfg(), NOON, vocab=TEST_VOCAB)
+        self.assertIn("退出尺寸上限", names_failed(r))
 
     def test_reduce_pct_guard_catches_the_2026_07_29_failure(self):
         """真实事故重演:仓位大跌到约等于一个标准尺寸,仍按标准尺寸减仓 → 卖出 91%。"""
@@ -247,7 +262,7 @@ class TestSize(unittest.TestCase):
         del o["amount_usd"]
         o["qty"], o["price"] = 0.1, 400.0
         r = run(o, cfg(), NOON, vocab=TEST_VOCAB)
-        detail = next(c.detail for c in r.checks if c.name == "单笔金额上限")
+        detail = next(c.detail for c in r.checks if c.name == "退出尺寸上限")
         self.assertIn("40.00", detail)
 
 
@@ -290,10 +305,18 @@ class TestReasonTag(unittest.TestCase):
 
 
 class TestDailyLimits(unittest.TestCase):
-    def test_daily_amount_cap_denies(self):
+    def test_daily_amount_cap_denies_buys(self):
+        today = [{"symbol": "CCCC", "side": "buy", "amount": 180.0}]
+        r = run(order(side="buy", reason_tag="建仓", amount_usd=30.0, today_orders=today,
+                      portfolio={"buying_power": 2000.0, "total_value": 5000.0},
+                      position={"market_value": 50.0}), cfg(), NOON, vocab=TEST_VOCAB)
+        self.assertIn("单日累计(buy)", names_failed(r))
+
+    def test_daily_amount_cap_exempts_sells(self):
+        """退出敞口不该被单日金额上限挡住。"""
         today = [{"symbol": "CCCC", "side": "sell", "amount": 180.0}]
         r = run(order(amount_usd=30.0, today_orders=today), cfg(), NOON, vocab=TEST_VOCAB)
-        self.assertIn("单日累计(sell)", names_failed(r))
+        self.assertNotIn("单日累计(sell)", names_failed(r))
 
     def test_daily_count_cap_denies(self):
         today = [{"symbol": f"S{i}", "side": "buy", "amount": 1.0} for i in range(6)]
@@ -447,30 +470,144 @@ if __name__ == "__main__":
     unittest.main()
 
 
-class TestRuleScope(unittest.TestCase):
-    """★ 未经数据支持的假设不能单独授权真钱下单。"""
+class TestEvidenceSizing(unittest.TestCase):
+    """★ 证据强度只约束新增风险(买入),且只有 primary_rule_id 决定尺寸。"""
 
-    def test_missing_rule_ids_scales_size_down(self):
-        """未声明依据 = 无法核实 = 按最低档尺寸。不能再靠"不声明"拿满额。"""
+    def _buy(self, **kw):
+        return order(side="buy", reason_tag="建仓", intent="",
+                     portfolio={"buying_power": 2000.0, "total_value": 5000.0},
+                     position={"market_value": 50.0}, **kw)
+
+    def test_sell_is_exempt_from_evidence_sizing(self):
+        r = run(order(amount_usd=100.0, position={"market_value": 200.0}),
+                cfg(), NOON, vocab=TEST_VOCAB)
+        c = next(x for x in r.checks if x.name.startswith("证据尺寸"))
+        self.assertTrue(c.ok)
+        self.assertIn("卖出降低风险", c.detail)
+
+    def test_buy_without_primary_rule_uses_lowest_tier(self):
         c = cfg(execution={"max_order_usd": 80, "size_scale_observe": 0.4})
-        # 80 × 0.4 = 32:$30 放行
-        self.assertEqual(run(order(amount_usd=30.0), c, NOON, vocab=TEST_VOCAB).verdict, ALLOW)
-        # $40 超过 32 → 拒绝,并给出允许金额
-        r = run(order(amount_usd=40.0, position={"market_value": 400.0}),
-                c, NOON, vocab=TEST_VOCAB)
-        self.assertEqual(r.verdict, DENY)
-        detail = next(x.detail for x in r.checks if x.name == "依据强度与尺寸")
-        self.assertIn("32.00", detail)
+        self.assertEqual(run(self._buy(amount_usd=30.0), c, NOON, vocab=TEST_VOCAB).verdict, ALLOW)
+        r = run(self._buy(amount_usd=40.0), c, NOON, vocab=TEST_VOCAB)
+        self.assertIn("证据尺寸", names_failed(r))
+        self.assertIn("32.00", next(x.detail for x in r.checks if x.name == "证据尺寸"))
 
-    def test_scaling_is_automatic_not_manual(self):
-        """超限时必须直接给出允许金额 —— 自动化流程不能要求人工换算。"""
-        r = run(order(amount_usd=40.0, position={"market_value": 400.0}),
+    def test_hint_states_the_allowed_amount(self):
+        """超限时必须直接给出允许金额 —— 自动化不能要求人工换算。"""
+        r = run(self._buy(amount_usd=40.0),
                 cfg(execution={"max_order_usd": 80, "size_scale_observe": 0.4}),
                 NOON, vocab=TEST_VOCAB)
-        hint = next(x.hint for x in r.checks if x.name == "依据强度与尺寸")
-        self.assertIn("$32.00", hint)
+        self.assertIn("$32.00", next(x.hint for x in r.checks if x.name == "证据尺寸"))
 
-    def test_unknown_rule_id_denies(self):
-        r = run(order(rule_ids=["根本不存在的规则"]), cfg(), NOON, vocab=TEST_VOCAB)
+    def test_unknown_primary_rule_denies(self):
+        r = run(self._buy(amount_usd=10.0, primary_rule_id="不存在的规则"),
+                cfg(), NOON, vocab=TEST_VOCAB)
+        self.assertIn("证据尺寸", names_failed(r))
+
+
+class TestInputValidation(unittest.TestCase):
+    def test_missing_required_fields(self):
+        errs = validate_order({"side": "buy", "amount_usd": 10})
+        self.assertTrue(any("symbol" in e for e in errs))
+        self.assertTrue(any("reason_tag" in e for e in errs))
+
+    def test_bad_side(self):
+        errs = validate_order({"symbol": "X", "side": "hold",
+                               "reason_tag": "建仓", "amount_usd": 1})
+        self.assertTrue(any("side" in e for e in errs))
+
+    def test_no_amount_or_qty(self):
+        errs = validate_order({"symbol": "X", "side": "buy", "reason_tag": "建仓"})
+        self.assertTrue(any("amount_usd 或 qty" in e for e in errs))
+
+    def test_clean_order_validates(self):
+        self.assertEqual(validate_order(BASE_ORDER), [])
+
+    def test_example_order_is_valid(self):
+        self.assertEqual(validate_order(preflight.EXAMPLE_ORDER), [])
+
+
+class TestCli(unittest.TestCase):
+    """CLI 入口测试 —— run() 通过不代表命令行可用。"""
+
+    def _main(self, argv):
+        import contextlib
+        import io
+
+        buf = io.StringIO()
+        with contextlib.redirect_stdout(buf):
+            code = preflight.main(argv)
+        return code, buf.getvalue()
+
+    def test_example_flag_works_alone(self):
+        """--example 不需要输入源 —— 曾因放进 required 互斥组而无法单独使用。"""
+        code, out = self._main(["--example"])
+        self.assertEqual(code, 0)
+        self.assertIn("reason_tag", out)
+        import json as _json
+
+        self.assertEqual(validate_order(_json.loads(out)), [])
+
+    def test_missing_input_source_errors(self):
+        with self.assertRaises(SystemExit):
+            preflight.main([])
+
+    def test_order_file_json_output(self):
+        import json as _json
+        import tempfile
+
+        with tempfile.NamedTemporaryFile("w", suffix=".json", delete=False,
+                                         encoding="utf-8") as fh:
+            _json.dump(BASE_ORDER, fh)
+            path = fh.name
+        code, out = self._main(["--order-file", path, "--json",
+                                "--now-et", "2026-08-18 13:00"])
+        payload = _json.loads(out)
+        self.assertIn(payload["verdict"], (ALLOW, DRY_RUN, DENY))
+        self.assertIn("checks", payload)
+
+    def test_deny_exits_nonzero(self):
+        import json as _json
+        import tempfile
+
+        bad = dict(BASE_ORDER, analysis_at_et="2026-08-18 08:00")
+        with tempfile.NamedTemporaryFile("w", suffix=".json", delete=False,
+                                         encoding="utf-8") as fh:
+            _json.dump(bad, fh)
+            path = fh.name
+        code, _ = self._main(["--order-file", path, "--now-et", "2026-08-18 13:00"])
+        self.assertEqual(code, 1)
+
+    def test_malformed_json_exits_two(self):
+        import tempfile
+
+        with tempfile.NamedTemporaryFile("w", suffix=".json", delete=False,
+                                         encoding="utf-8") as fh:
+            fh.write("{not json")
+            path = fh.name
+        code = preflight.main(["--order-file", path])
+        self.assertEqual(code, 2)
+
+
+class TestMultipleBlockers(unittest.TestCase):
+    def test_all_blockers_reported_not_just_first(self):
+        """一次跑完所有闸门,不要 fail-fast —— 用户需要一次看到全部问题。"""
+        r = run(
+            order(
+                amount_usd=500.0,
+                analysis_at_et="2026-08-18 08:00",
+                quote_timestamp_et="2026-08-18 08:00",
+                reason_tag="瞎卖",
+                ref_id="bad",
+            ),
+            cfg(execution={"enabled": False}),
+            NOON,
+        )
         self.assertEqual(r.verdict, DENY)
-        self.assertIn("依据强度与尺寸", names_failed(r))
+        self.assertGreaterEqual(len(r.blockers), 5)
+
+
+if __name__ == "__main__":
+    unittest.main()
+
+

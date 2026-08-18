@@ -234,3 +234,22 @@ class TestSummarize(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class TestOptionalRuleIdsColumn(unittest.TestCase):
+    """第 11 列 rule_ids 是后加的 —— 旧的 10 列台账必须继续可读。"""
+
+    def test_ten_column_row_still_parses(self):
+        p = tsv(row("2026-08-01", "10:33", "X", "buy", 1, 100.0, 100.0, "建仓"))
+        t = parse_trades(p, vocab=TEST_VOCAB)[0]
+        self.assertEqual(t.rule_ids, [])
+
+    def test_eleven_column_row_parses_rule_ids(self):
+        line = "\t".join(["2026-08-01", "10:33", "X", "buy", "1", "100.0", "100.0",
+                          "建仓", "", "备注", "rule-a;rule-b"])
+        t = parse_trades(tsv(line), vocab=TEST_VOCAB)[0]
+        self.assertEqual(t.rule_ids, ["rule-a", "rule-b"])
+
+    def test_too_few_columns_still_rejected(self):
+        with self.assertRaises(LedgerError):
+            parse_trades(tsv("2026-08-01\t10:33\tX\tbuy"), vocab=TEST_VOCAB)

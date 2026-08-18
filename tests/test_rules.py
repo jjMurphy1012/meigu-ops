@@ -428,3 +428,63 @@ last_audited = ""
         self.assertEqual(R.main(["--file", str(p), "--record-evidence", "x3", "事实一条"]), 0)
         rules, _, _ = load_rules(path=p)
         self.assertEqual(rules[0].evidence, ["事实一条"])
+
+
+class TestWriteRobustness(unittest.TestCase):
+    """写入必须原子且经校验 —— 一次写坏就会让整套审计静默失真。"""
+
+    def setUp(self):
+        self.path = toml_file('''
+[[rule]]
+id        = "r1"
+statement = "一句能被证伪的话"
+kind      = "market"
+test      = { type = "manual", how = "人工核查" }
+status    = "hypothesis"
+evidence  = []
+last_audited = ""
+''')
+        self.before = self.path.read_text(encoding="utf-8")
+
+    def test_evidence_with_newlines_does_not_corrupt(self):
+        """含换行的证据必须被转义 —— 直接写进去 TOML 立刻损坏。"""
+        R.record_evidence("r1", "第一行\n第二行\t带制表符", path=self.path)
+        rules, _, _ = load_rules(path=self.path)   # 仍可解析即通过
+        self.assertIn("第一行", rules[0].evidence[0])
+        self.assertIn("第二行", rules[0].evidence[0])
+        # 文件里必须是转义形式,不能是裸换行(裸换行会让 TOML 立刻损坏)
+        self.assertNotIn("第一行\n第二行", self.path.read_text(encoding="utf-8"))
+
+    def test_evidence_with_quotes_does_not_corrupt(self):
+        R.record_evidence("r1", '他说"这条不成立"', path=self.path)
+        rules, _, _ = load_rules(path=self.path)
+        self.assertIn("这条不成立", rules[0].evidence[0])
+
+    def test_invalid_kind_is_rejected_before_writing(self):
+        """非法 kind 必须当场拒绝,不能"报成功然后文件读不出来"。"""
+        with self.assertRaises(ConfigError):
+            R.add_rule("r2", "x", kind="nonsense", path=self.path)
+        self.assertEqual(self.path.read_text(encoding="utf-8"), self.before)
+        load_rules(path=self.path)                 # 文件仍然合法
+
+    def test_reenable_clears_stale_none_scope(self):
+        """refuted → supported 后必须能重新启用,否则规则永久卡死。"""
+        R.set_status("r1", "refuted", path=self.path)
+        self.assertEqual(load_rules(path=self.path)[0][0].scope, "none")
+        R.set_status("r1", "supported", path=self.path)
+        r = load_rules(path=self.path)[0][0]
+        self.assertEqual(r.status, "supported")
+        self.assertEqual(r.scope, "live")
+        self.assertTrue(r.may_authorize_live)
+
+    def test_failed_write_leaves_original_untouched(self):
+        """写入会产生非法状态时必须回滚,原文件一个字节都不能变。"""
+        with self.assertRaises(ConfigError):
+            R.set_status("r1", "enforced", path=self.path)   # market + 非 enforced_by
+        self.assertEqual(self.path.read_text(encoding="utf-8"), self.before)
+
+    def test_provisional_is_a_middle_tier(self):
+        R.set_status("r1", "provisional", path=self.path)
+        r = load_rules(path=self.path)[0][0]
+        self.assertEqual(r.scope, "live")
+        self.assertTrue(r.may_authorize_live)

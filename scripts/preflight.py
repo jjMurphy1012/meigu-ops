@@ -65,8 +65,9 @@ GATE_NAMES = (
     "意图时效",
     "报价时间戳熔断",
     "理由标签",
-    "依据强度与尺寸",
+    "证据尺寸",
     "单笔金额上限",
+    "退出尺寸上限",
     "减仓占比",
     "残值仓",
     "买力充足",
@@ -310,8 +311,25 @@ def check_size(r: Result, cfg: dict, order: dict) -> None:
         r.add("单笔金额", False, "无法确定金额(需要 amount_usd,或 qty + price)")
         return
 
+    side = str(order.get("side", "")).lower()
     cap = float(ex.get("max_order_usd", 80))
-    r.add("单笔金额上限", amount <= cap, f"${amount:.2f} / 上限 ${cap:.2f}")
+    if side == "sell":
+        # ★ 退出敞口不受单笔上限约束 —— 卖出的尺寸天然被持仓本身封顶,
+        # 用 max_order_usd 卡住会造成"能建仓、不能完整平仓"。
+        mv = (order.get("position") or {}).get("market_value")
+        if mv:
+            bound = float(mv) * 1.02          # 留 2% 余量给价格波动
+            r.add("退出尺寸上限", amount <= bound,
+                  f"${amount:.2f} / 该仓位市值 ${float(mv):.2f}(+2% 余量)",
+                  hint="卖出金额超过持仓市值 —— 检查是不是算错了股数。"
+                  if amount > bound else "")
+        else:
+            r.add("退出尺寸上限", amount <= cap,
+                  f"${amount:.2f} / 上限 ${cap:.2f}(订单未提供持仓市值)",
+                  hint="订单里带上 position.market_value,完整平仓就不会被单笔上限卡住。"
+                  if amount > cap else "")
+    else:
+        r.add("单笔金额上限", amount <= cap, f"${amount:.2f} / 上限 ${cap:.2f}")
 
     if amount <= 0:
         r.add("金额为正", False, f"金额必须 > 0,实际 {amount}")
@@ -394,90 +412,116 @@ def check_concentration_and_bp(r: Result, cfg: dict, order: dict) -> None:
         )
 
 
-def rule_size_tier(rule, summary: dict, ex: dict) -> tuple[float, str]:
-    """一条规则允许多大的尺寸系数,以及理由。
+def rule_size_tier(rule, ex: dict) -> tuple[float, str]:
+    """一条**市场判断类**规则允许的尺寸系数。
 
-    证据强度决定**仓位大小**,不决定能不能交易 —— 否则第一天就死锁:
-    没有数据 → 不许交易 → 永远攒不到验证规则所需的数据。
+    ★ 由 `status` 决定,不由审计结果决定。
+    审计只产生**升级建议**;实际放大尺寸必须经用户 `--set-status --approved`。
+    (旧实现让审计结果直接决定尺寸,导致"状态需批准"形同虚设 —— 攒够样本就自动满额。)
     """
-    from rules import MODERATE, STRONG, SUPPORTS, WEAK, audit_rule
-
     observe = float(ex.get("size_scale_observe", 0.4))
     weak = float(ex.get("size_scale_weak", 0.7))
     supported = float(ex.get("size_scale_supported", 1.0))
 
     if rule.scope == "none":
         return 0.0, f"{rule.id} 已停用({rule.status})"
-    if rule.kind == "process":
-        return supported, f"{rule.id} 流程纪律"
-
-    v = audit_rule(rule, summary)
-    if v.result == SUPPORTS and v.confidence in (MODERATE, STRONG):
-        return supported, f"{rule.id} 数据支持({v.samples} 事件)"
-    if v.result == SUPPORTS and v.confidence == WEAK:
-        return weak, f"{rule.id} 弱支持({v.samples} 事件)"
     if rule.status == "supported":
-        return supported, f"{rule.id} 你已批准升为 supported"
-    return observe, f"{rule.id} 观察期({v.samples} 事件)"
+        return supported, f"{rule.id} 已获批准为 supported"
+    if rule.status == "provisional":
+        return weak, f"{rule.id} 已获批准为 provisional"
+    return observe, f"{rule.id} 仍是 {rule.status}(未获批准放大尺寸)"
 
 
-def check_rule_scope_and_size(r: Result, cfg: dict, order: dict) -> None:
-    """按依据规则的证据强度自动缩放单笔上限。
+def check_evidence_size(r: Result, cfg: dict, order: dict) -> None:
+    """按证据强度约束**新增风险**的尺寸。
 
-    · 未声明 rule_ids → 按最低档(无法核实依据,就不能给更大尺寸)
-    · 声明多条 → 取其中**最强**的一条(引用额外的弱上下文不该受罚)
-    · 引用已停用(refuted / retired)的规则 → 直接拒绝
+    三条设计原则:
+    1. **只约束买入。** 卖出是降低风险 —— 证据不足不该妨碍你退出已有敞口,
+       否则系统会变成"允许建仓、不允许平仓"。
+    2. **只有 `primary_rule_id` 决定尺寸。** 旧实现对多条依据取 max,
+       于是"引用一条弱规则 + 附带一条强规则"就能拿到强规则的尺寸。
+    3. **只有市场判断类规则参与缩放。** 流程纪律(process/invariant/enforced)
+       是安全闸门,不是下单理由 —— 旧实现让它们返回 1.0,agent 引用一条公开的
+       流程规则就能绕开 40% 限制。
     """
     ex = cfg.get("execution", {})
-    observe_scale = float(ex.get("size_scale_observe", 0.4))
-    cap = float(ex.get("max_order_usd", 80))
+    side = str(order.get("side", "")).lower()
     amount = _order_amount(order) or 0.0
-    ids = [str(x) for x in (order.get("rule_ids") or [])]
 
-    if not ids:
-        allowed = cap * observe_scale
+    if side == "sell":
         r.add(
-            "依据强度与尺寸",
-            amount <= allowed,
-            f"未声明 rule_ids → 按最低档 ×{observe_scale:g}:上限 ${allowed:.2f}"
-            f"(本笔 ${amount:.2f})",
-            hint=f"把金额降到 ${allowed:.2f} 以内即可放行;"
-                 f"或在订单里声明 rule_ids —— 依据已被数据支持的规则可以拿更大尺寸。",
+            "证据尺寸(仅约束买入)",
+            True,
+            "卖出降低风险,不受证据强度约束",
+            fatal=False,
+            hint="退出敞口的尺寸由持仓本身与「减仓占比」闸门约束,不由证据强度约束。",
         )
         return
 
+    observe_scale = float(ex.get("size_scale_observe", 0.4))
+    cap = float(ex.get("max_order_usd", 80))
+
+    primary = str(order.get("primary_rule_id", "") or "")
+    context = [str(x) for x in (order.get("context_rule_ids") or order.get("rule_ids") or [])]
+
+    if not primary:
+        allowed = cap * observe_scale
+        r.add(
+            "证据尺寸",
+            amount <= allowed,
+            f"未声明 primary_rule_id → 按最低档 ×{observe_scale:g}:上限 ${allowed:.2f}"
+            f"(本笔 ${amount:.2f})",
+            hint=f"降到 ${allowed:.2f} 以内即可放行;或声明本笔主要依据的那**一条**规则 —— "
+                 f"已获批准为 supported 的规则可以拿满额。",
+        )
+        return
+
+    # ★ fail-closed:算不出证据等级就不许下单。真钱模式不能因为读文件失败而放行。
     try:
         from rules import load_rules
-        from stats import summarize
 
         rules, _, _ = load_rules()
-        summary = summarize(parse_trades())
     except Exception as exc:                      # noqa: BLE001
-        r.add("依据强度与尺寸", False, f"无法加载规则或台账:{exc}", fatal=False)
+        r.add(
+            "证据尺寸",
+            False,
+            f"无法加载 config/rules.toml,证据等级不可计算:{exc}",
+            hint="真钱模式必须 fail-closed。先跑 make rules-check 修好规则文件。",
+        )
         return
 
     by_id = {x.id: x for x in rules}
-    unknown = [i for i in ids if i not in by_id]
+    unknown = [i for i in [primary, *context] if i and i not in by_id]
     if unknown:
-        r.add("依据强度与尺寸", False, f"引用了不存在的规则 id:{unknown}",
+        r.add("证据尺寸", False, f"引用了不存在的规则 id:{unknown}",
               hint="检查 config/rules.toml,或跑 make rules-check。")
         return
 
-    tiers = [rule_size_tier(by_id[i], summary, ex) for i in ids]
-    dead = [why for scale, why in tiers if scale == 0.0]
-    if dead:
-        r.add("依据强度与尺寸", False, f"引用了已停用的规则:{dead}",
+    rule = by_id[primary]
+    if rule.kind != "market":
+        r.add(
+            "证据尺寸",
+            False,
+            f"primary_rule_id 必须是市场判断类规则,{primary} 是 {rule.kind}",
+            hint="流程纪律是安全闸门,不是下单理由 —— 不能用它来放大仓位。",
+        )
+        return
+
+    scale, why = rule_size_tier(rule, ex)
+    if scale == 0.0:
+        r.add("证据尺寸", False, f"主依据已停用:{why}",
               hint="refuted / retired 的规则只保留历史,不参与决策。")
         return
 
-    best_scale, best_why = max(tiers, key=lambda x: x[0])
-    allowed = cap * best_scale
+    allowed = cap * scale
+    dead_ctx = [by_id[i].id for i in context if i and by_id[i].scope == "none"]
     r.add(
-        "依据强度与尺寸",
-        amount <= allowed,
-        f"最强依据 {best_why} → ×{best_scale:g},上限 ${allowed:.2f}(本笔 ${amount:.2f})",
-        hint=f"把金额降到 ${allowed:.2f} 以内即可放行 —— "
-             f"仓位随证据积累自动放大,不需要人工调整。"
+        "证据尺寸",
+        amount <= allowed and not dead_ctx,
+        f"主依据 {why} → ×{scale:g},上限 ${allowed:.2f}(本笔 ${amount:.2f})"
+        + (f";上下文引用了已停用规则 {dead_ctx}" if dead_ctx else ""),
+        hint=f"降到 ${allowed:.2f} 以内即可放行 —— 要放大尺寸,先让 review 用数据"
+             f"给出升级建议,再由你 --set-status --approved。"
         if amount > allowed
         else "",
     )
@@ -507,11 +551,17 @@ def check_daily_limits(r: Result, cfg: dict, order: dict) -> None:
     same_side = [o for o in today if str(o.get("side", "")).lower() == side]
     used = sum(float(o.get("amount", o.get("amount_usd", 0)) or 0) for o in same_side)
     cap_daily = float(ex.get("max_daily_usd", 200))
-    r.add(
-        f"单日累计({side})",
-        used + amount <= cap_daily,
-        f"已用 ${used:.2f} + 本笔 ${amount:.2f} = ${used + amount:.2f} / 上限 ${cap_daily:.2f}",
-    )
+    if side == "sell":
+        # 退出敞口不受单日金额上限约束(同上:不能让风控阻止你降低风险)
+        r.add(f"单日累计({side})", True,
+              f"已用 ${used:.2f} + 本笔 ${amount:.2f} —— 卖出不受单日金额上限约束",
+              fatal=False)
+    else:
+        r.add(
+            f"单日累计({side})",
+            used + amount <= cap_daily,
+            f"已用 ${used:.2f} + 本笔 ${amount:.2f} = ${used + amount:.2f} / 上限 ${cap_daily:.2f}",
+        )
 
     cap_n = int(ex.get("max_orders_per_day", 6))
     r.add(
@@ -585,7 +635,7 @@ def run(order: dict, cfg: dict, now: dt.datetime | None = None, vocab=None) -> R
     check_intent_freshness(r, cfg, order, now)
     check_quote_timestamp(r, cfg, order, now)
     check_reason_tag(r, order, vocab)
-    check_rule_scope_and_size(r, cfg, order)
+    check_evidence_size(r, cfg, order)
     check_size(r, cfg, order)
     check_concentration_and_bp(r, cfg, order)
     check_daily_limits(r, cfg, order)
