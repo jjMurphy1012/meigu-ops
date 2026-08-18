@@ -12,7 +12,7 @@
 <p align="center">
   <img src="https://img.shields.io/badge/Python-3.11+-3776AB?style=flat&logo=python&logoColor=white" alt="Python 3.11+">
   <img src="https://img.shields.io/badge/dependencies-none-2ea44f?style=flat" alt="Zero dependencies">
-  <img src="https://img.shields.io/badge/tests-364%20passing-2ea44f?style=flat" alt="364 tests">
+  <img src="https://img.shields.io/badge/tests-366%20passing-2ea44f?style=flat" alt="366 tests">
   <a href="https://claude.com/claude-code"><img src="https://img.shields.io/badge/Built_with-Claude_Code-000?style=flat&logo=anthropic&logoColor=white" alt="Built with Claude Code"></a>
   <img src="https://img.shields.io/badge/License-MIT-blue.svg" alt="MIT">
   <a href="DISCLAIMER.md"><img src="https://img.shields.io/badge/%E2%9A%A0%EF%B8%8F-not_investment_advice-critical" alt="Not investment advice"></a>
@@ -75,7 +75,7 @@ is checked, and that every rule eventually has to answer to data.
    in tiers, so six months later "why did I sell?" is answered by the ledger, not memory.
 6. **Your strategy and account data never leak.** System layer and user layer are hard
    split, enforced by gitignore, a dedicated scanner, and CI.
-7. **Fully auditable, zero dependencies.** 364 tests, Python standard library only.
+7. **Fully auditable, zero dependencies.** 366 tests, Python standard library only.
    Every gate has a test proving it actually blocks.
 
 ---

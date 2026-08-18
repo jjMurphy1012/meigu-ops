@@ -229,5 +229,34 @@ class TestTestFilesAreFullyLoadable(unittest.TestCase):
         self.assertEqual(offenders, [], "\n".join(offenders))
 
 
+class TestCrossPlatformOutput(unittest.TestCase):
+    """★ 输出编码是跨平台的第一道坎。
+
+    Windows 控制台默认编码编不出 ✅ ❌ ⚠️,而本项目每行输出都带它们 ——
+    不处理的话整套 CLI 在 Windows 上跑不完一条命令。
+    """
+
+    def test_stdout_is_utf8_after_import(self):
+        import sys
+
+        import meigu_lib  # noqa: F401  (导入即生效)
+
+        enc = (getattr(sys.stdout, "encoding", "") or "").lower()
+        self.assertIn(enc, ("utf-8", "utf8"), f"stdout 编码是 {enc}")
+
+    def test_helper_tolerates_streams_without_reconfigure(self):
+        import io
+        import sys
+
+        import meigu_lib
+
+        saved = sys.stdout
+        sys.stdout = io.StringIO()          # StringIO 没有 reconfigure
+        try:
+            meigu_lib._force_utf8_output()  # 不得抛异常
+        finally:
+            sys.stdout = saved
+
+
 if __name__ == "__main__":
     unittest.main()

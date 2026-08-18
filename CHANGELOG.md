@@ -6,6 +6,27 @@
 
 ---
 
+## v5.12.1(2026-08-18)· Windows CI 第一次运行就证明了 Windows 跑不起来
+
+加上 Windows runner 的**第一次** CI 就红了 —— 这正是加它的意义:
+在此之前 README 里的"Windows ✅"只是代码审查的结论。
+
+两个真实缺陷(ubuntu / macOS 全绿,只有 Windows 失败):
+
+**1. `✅` 让每一条命令都崩。** Windows 控制台默认编码是 cp1252 / cp936,
+编不出 ✅ ❌ ⚠️,而本项目**每一行输出**都带这些符号 —— `UnicodeEncodeError`。
+不是测试的问题,是**整套 CLI 在 Windows 上跑不完一条命令**。
+现在 `meigu_lib` 导入时把 stdout/stderr 切到 UTF-8(输出被重定向到管道/文件时
+同样需要:那时 Python 用的是本地编码)。
+
+**2. 断言写死了 `/` 分隔符。** `assertIn("examples/", source)` 在 Windows 上
+永远为假 —— 改成比对 `Path(...).parts`。
+
+测试 364 → 366(新增两条:导入后 stdout 必须是 UTF-8;辅助函数遇到没有
+`reconfigure` 的流不得抛异常)。
+
+---
+
 ## v5.12.0(2026-08-18)· 能被调用方替换的上限不是上限
 
 ### P0

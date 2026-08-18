@@ -123,7 +123,7 @@ make rules-check     # 格式、标签引用、闸门引用
 
 ```bash
 make doctor          # 应该只剩防休眠类的提醒
-make test            # 364 个测试应全绿
+make test            # 366 个测试应全绿
 make trading-day     # 今天是不是交易日
 make report          # 生成 reports/{今天}.md 骨架
 ```

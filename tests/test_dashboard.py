@@ -452,7 +452,8 @@ class TestCli(unittest.TestCase):
         """demo 模式必须只读 examples/ —— 录 gif 时绝不能碰真实数据。"""
         data = load_dashboard_data(demo=True)
         self.assertTrue(data.demo)
-        self.assertIn("examples/", data.snapshot.source)
+        # Windows 上路径分隔符是 `\`,断言写死 "examples/" 会假失败
+        self.assertIn("examples", Path(data.snapshot.source).parts)
 
 
 

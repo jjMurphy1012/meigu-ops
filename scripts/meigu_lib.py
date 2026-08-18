@@ -6,9 +6,34 @@
 from __future__ import annotations
 
 import datetime as dt
+import sys
 import tomllib
 from dataclasses import dataclass, field
 from pathlib import Path
+
+
+def _force_utf8_output() -> None:
+    """把标准输出/错误切到 UTF-8。
+
+    ★ Windows 控制台默认是 cp1252 / cp936 之类的编码,遇到 ✅ ❌ ⚠️ 会直接抛
+    `UnicodeEncodeError` —— 而本项目每个脚本的每一行输出都带这些符号。
+    不做这件事,**整套 CLI 在 Windows 上跑不完一条命令**。
+
+    2026-08-18 加上 Windows CI runner 的第一次运行就暴露了它;在那之前
+    README 里的"Windows ✅"只是代码审查的结论,不是实测结果。
+
+    输出被重定向到管道/文件时同样需要:那时 Python 用的是本地编码。
+    """
+    for stream in (sys.stdout, sys.stderr):
+        try:
+            if stream and (getattr(stream, "encoding", "") or "").lower() \
+                    not in ("utf-8", "utf8"):
+                stream.reconfigure(encoding="utf-8", errors="replace")
+        except (AttributeError, ValueError, OSError):
+            pass                      # StringIO 之类没有 reconfigure,忽略即可
+
+
+_force_utf8_output()
 
 ROOT = Path(__file__).resolve().parent.parent
 
