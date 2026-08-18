@@ -3,7 +3,7 @@ S  := scripts
 
 .DEFAULT_GOAL := help
 
-.PHONY: help setup setup-checklist start-drill doctor trading-day calendar report journal-check \
+.PHONY: help setup setup-checklist setup-demo start-drill doctor trading-day calendar report journal-check \
         journal-compress stats \
         preflight preflight-example rules-check dashboard dashboard-demo demo snapshot \
         check-privacy test lint clean
@@ -17,6 +17,9 @@ setup: ## ★ 首次接入:看当前处于哪一步、下一步做什么
 
 setup-checklist: ## 接入各步的验收项清单
 	@$(PY) $(S)/setup.py --checklist
+
+setup-demo: ## 用 examples/ 固件跑同一套接入判定(演示用,不读真实配置)
+	@$(PY) $(S)/setup.py --demo
 
 start-drill: ## 开一次 dry-run 演练,打印 run id(preflight 用它写证据)
 	@$(PY) $(S)/setup.py --start-drill

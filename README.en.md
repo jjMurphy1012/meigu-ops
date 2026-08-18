@@ -12,7 +12,7 @@
 <p align="center">
   <img src="https://img.shields.io/badge/Python-3.11+-3776AB?style=flat&logo=python&logoColor=white" alt="Python 3.11+">
   <img src="https://img.shields.io/badge/dependencies-none-2ea44f?style=flat" alt="Zero dependencies">
-  <img src="https://img.shields.io/badge/tests-358%20passing-2ea44f?style=flat" alt="358 tests">
+  <img src="https://img.shields.io/badge/tests-359%20passing-2ea44f?style=flat" alt="359 tests">
   <a href="https://claude.com/claude-code"><img src="https://img.shields.io/badge/Built_with-Claude_Code-000?style=flat&logo=anthropic&logoColor=white" alt="Built with Claude Code"></a>
   <img src="https://img.shields.io/badge/License-MIT-blue.svg" alt="MIT">
   <a href="DISCLAIMER.md"><img src="https://img.shields.io/badge/%E2%9A%A0%EF%B8%8F-not_investment_advice-critical" alt="Not investment advice"></a>
@@ -34,7 +34,53 @@
 
 ---
 
-## ⚠️ What this project deliberately does NOT provide
+## What this is
+
+**An AI-driven assistant system for trading US equities.**
+
+By default it installs **five cron checkpoints** per trading day. At each one the AI
+wakes up on its own, reads live quotes and positions, checks them against *your* rules,
+and commits to buy / sell / do nothing — then writes the day into your ledger:
+
+```
+9:12   /meigu-ops premarket   Plan: candidates, triggers, defenses, what NOT to do
+10:33  /meigu-ops check       Intraday: three-question filter → buy / sell / hold
+13:03  /meigu-ops check
+15:37  /meigu-ops check
+16:06  /meigu-ops journal     Close: journal + ledger + tiered compaction
+```
+
+**"Assistant" is meant literally:** it does not decide what you should believe.
+It guarantees that what you *do* believe gets executed every day, that every execution
+is checked, and that every rule eventually has to answer to data.
+
+## What you actually get
+
+1. **Watching the market stops costing you attention.** Five checkpoints fire whether
+   you are in a meeting, in class, or asleep — and each one is a full analysis, not a
+   "XYZ moved 3%" notification. It also never gets tired; humans do.
+2. **Every order passes a deterministic gate.** `preflight.py` runs 20+ programmatic
+   checks and returns `ALLOW` / `DRY_RUN` / `DENY`. `DENY` means no, and the agent may
+   not "manually override" it. It catches the mistakes you only notice afterwards:
+   trimming 90% of a position you meant to trim a little; ordering off a stale quote
+   after the machine slept; selling more shares than you hold; the wrong sub-account.
+3. **Your discipline finally has a verdict.** Every rule you write is referenced at
+   decision time and audited against your own ledger later. `make stats` tells you how
+   many decision events tested it and whether they support or refute it — and it
+   **refuses to conclude** when the sample is too small.
+4. **Position size scales with evidence, automatically.** A fresh hypothesis trades at
+   40%, weakly supported at 70%, supported at full size. Evidence governs *size*, not
+   permission — otherwise you deadlock on day one.
+5. **Forgetting stops costing you.** The journal is written at the close and compacted
+   in tiers, so six months later "why did I sell?" is answered by the ledger, not memory.
+6. **Your strategy and account data never leak.** System layer and user layer are hard
+   split, enforced by gitignore, a dedicated scanner, and CI.
+7. **Fully auditable, zero dependencies.** 359 tests, Python standard library only.
+   Every gate has a test proving it actually blocks.
+
+---
+
+## One boundary worth stating plainly: no trading strategy included
 
 **It does not provide a trading strategy.**
 
@@ -55,17 +101,6 @@ you write a rule ──► cited during daily decisions ──► trades hit the
 ```
 
 ## What it does
-
-```
-9:12   /meigu-ops premarket   Plan: candidates, triggers, defense, "what not to do today"
-10:33  /meigu-ops check       Intraday: three-question filter → buy / sell / hold
-13:03  /meigu-ops check
-15:37  /meigu-ops check
-16:06  /meigu-ops journal     Close: journal + ledger + tiered compression + evidence
-       /meigu-ops daily       Closing report (15 sections, skeleton driven by your config)
-       /meigu-ops review      Periodic review → audit every one of your rules against data
-       /meigu-ops stats       FIFO realized P&L / performance by tag / rule audit
-```
 
 It does not forecast markets. It does something else: **it guarantees today's judgment
 won't be worse than last time's.**
