@@ -12,7 +12,7 @@
 <p align="center">
   <img src="https://img.shields.io/badge/Python-3.11+-3776AB?style=flat&logo=python&logoColor=white" alt="Python 3.11+">
   <img src="https://img.shields.io/badge/dependencies-none-2ea44f?style=flat" alt="Zero dependencies">
-  <img src="https://img.shields.io/badge/tests-244%20passing-2ea44f?style=flat" alt="244 tests">
+  <img src="https://img.shields.io/badge/tests-261%20passing-2ea44f?style=flat" alt="261 tests">
   <a href="https://claude.com/claude-code"><img src="https://img.shields.io/badge/Built_with-Claude_Code-000?style=flat&logo=anthropic&logoColor=white" alt="Built with Claude Code"></a>
   <img src="https://img.shields.io/badge/License-MIT-blue.svg" alt="MIT">
   <a href="DISCLAIMER.md"><img src="https://img.shields.io/badge/%E2%9A%A0%EF%B8%8F-%E4%B8%8D%E6%9E%84%E6%88%90%E6%8A%95%E8%B5%84%E5%BB%BA%E8%AE%AE-critical" alt="Not investment advice"></a>
@@ -69,7 +69,7 @@
 | **策略层完全私有** | 标签词表、纪律规则、散文策略、账户参数全部 gitignore。仓库只有 `*.example.*` 模板(问题清单,零答案) |
 | **规则可被数据审计** | 把纪律写成可证伪的条目,`make stats` 用台账数据判定它成立与否。**从未被数据支持过的规则是包袱,不是资产** |
 | **审计拒绝草率结论** | 结论方向与证据强度分离:< 10 个决策事件不下结论,10–19 只给"弱支持/弱反驳",≥ 20 才可**建议**改状态 —— 而任何状态变更都需要你批准 |
-| **新假设不能拿真钱试** | 执行层级与状态正交:`hypothesis` 默认只能 `observe`,preflight 会拦住"全部依据都处于观察期"的订单 |
+| **仓位随证据自动缩放** | 证据强度决定**尺寸**而不是决定能否交易 —— 否则第一天就死锁(没数据→不许交易→永远攒不到数据)。未验证的假设按 40% 仓位跑,弱支持 70%,已支持满额。**全自动,无需人工缩小** |
 | **样本单位是决策事件** | 一笔卖单匹配三个历史买入批次,仍然只算**一次**退出决策 —— 不是三个样本 |
 | **确定性下单闸门** | `preflight.py` 把意图时效、券商报价时间戳熔断、减仓占比、集中度、单日上限、`ref_id` 去重做成**程序**而非散文,返回 `ALLOW`/`DRY_RUN`/`DENY` |
 | **下单授权默认关闭** | `execution.enabled = false` 是仓库默认值 —— clone 不继承任何人的授权。授权是本地事实 |
@@ -92,7 +92,7 @@ cp config/rules.example.toml        config/rules.toml         # 可检验的规�
 
 make doctor        # 环境自检
 make rules-check   # 规则格式 / 标签引用 / 闸门引用
-make test          # 244 个测试
+make test          # 261 个测试
 make report        # 生成当日日报骨架
 ```
 
@@ -109,6 +109,7 @@ make report        # 生成当日日报骨架
 | `make doctor` | 配置 / 时钟漂移 / 防休眠 / 权限白名单 / 台账 / 日志 | 每一项都对应一次真实故障 |
 | `make preflight` | 下单前置检查 → `ALLOW`/`DRY_RUN`/`DENY` | 最有后果的检查最不该靠自觉 |
 | `make rules-check` | 规则格式、标签引用、闸门引用、散文同步 | 写错闸门名会让规则显示「程序强制」但其实无人把守 |
+| `rules.py --record-evidence` / `--set-status` | 机械化地写回规则(改状态需 `--approved`) | 让 agent 手改 TOML 会静默破坏审计 |
 | `make stats` | FIFO 实现盈亏 / 标签绩效 / **规则审计** | 复盘最大的陷阱是凭印象 |
 | `make dashboard` | 只读仪表盘 TUI | 每天要看的三张表,一屏看完 |
 | `make trading-day` | 交易日 / 半日市 / 上下一交易日 | 观察日顺延、耶稣受难日人算会错,错一次毁一天 |

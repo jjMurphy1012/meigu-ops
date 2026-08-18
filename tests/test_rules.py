@@ -276,3 +276,155 @@ class TestNoBuiltInStrategy(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class TestWriteCommands(unittest.TestCase):
+    """自我进化闭环的写回环节 —— 必须由脚本做,agent 手改 TOML 会静默破坏审计。"""
+
+    def setUp(self):
+        import shutil
+
+        self.path = toml_file('''
+[[rule]]
+id        = "w1"
+statement = "一句能被证伪的话"
+kind      = "market"
+test      = { type = "manual", how = "人工核查" }
+status    = "hypothesis"
+evidence  = []
+last_audited = ""
+
+[[rule]]
+id        = "w2"
+statement = "第二条"
+kind      = "market"
+test      = { type = "manual", how = "人工核查" }
+status    = "hypothesis"
+evidence  = ["已有一条"]
+last_audited = ""
+''')
+        self.shutil = shutil
+
+    def _rule(self, rid):
+        rules, _, _ = load_rules(path=self.path)
+        return next(r for r in rules if r.id == rid)
+
+    def test_record_evidence_into_empty_list(self):
+        R.record_evidence("w1", "2026-08-19 第一条证据", path=self.path)
+        self.assertEqual(self._rule("w1").evidence, ["2026-08-19 第一条证据"])
+
+    def test_record_evidence_appends_to_existing(self):
+        R.record_evidence("w2", "新的一条", path=self.path)
+        self.assertEqual(self._rule("w2").evidence, ["已有一条", "新的一条"])
+
+    def test_record_evidence_does_not_touch_other_rules(self):
+        R.record_evidence("w1", "只给 w1", path=self.path)
+        self.assertEqual(self._rule("w2").evidence, ["已有一条"])
+
+    def test_record_evidence_escapes_quotes(self):
+        R.record_evidence("w1", '含"引号"的证据', path=self.path)
+        self.assertIn('含"引号"的证据', self._rule("w1").evidence)
+
+    def test_unknown_id_is_rejected(self):
+        with self.assertRaises(ConfigError) as ctx:
+            R.record_evidence("nope", "x", path=self.path)
+        self.assertIn("找不到", str(ctx.exception))
+
+    def test_set_status_promotes(self):
+        R.set_status("w1", "supported", path=self.path)
+        r = self._rule("w1")
+        self.assertEqual(r.status, "supported")
+        self.assertTrue(r.may_authorize_live)
+
+    def test_set_status_updates_last_audited(self):
+        R.set_status("w1", "supported", path=self.path)
+        self.assertNotEqual(self._rule("w1").last_audited, "")
+
+    def test_demotion_also_disables_scope(self):
+        """降级必须同步停用 —— 否则会出现『状态说停用、作用域还在跑』。"""
+        R.set_status("w1", "refuted", path=self.path)
+        r = self._rule("w1")
+        self.assertEqual(r.status, "refuted")
+        self.assertEqual(r.scope, "none")
+        self.assertFalse(r.active)
+
+    def test_set_status_note_becomes_evidence(self):
+        R.set_status("w1", "supported", note="数据支持", path=self.path)
+        self.assertTrue(any("数据支持" in e for e in self._rule("w1").evidence))
+
+    def test_set_status_rejects_unknown_status(self):
+        with self.assertRaises(ConfigError):
+            R.set_status("w1", "maybe", path=self.path)
+
+    def test_add_rule_defaults_to_observe(self):
+        """新假设默认只能观察 —— 不该一写出来就能指导满额下单。"""
+        R.add_rule("w3", "新的可证伪命题", path=self.path)
+        r = self._rule("w3")
+        self.assertEqual(r.status, "hypothesis")
+        self.assertEqual(r.scope, "observe")
+        self.assertFalse(r.may_authorize_live)
+
+    def test_add_rule_rejects_duplicate_id(self):
+        with self.assertRaises(ConfigError) as ctx:
+            R.add_rule("w1", "重复 id", path=self.path)
+        self.assertIn("已存在", str(ctx.exception))
+
+    def test_file_stays_parseable_after_every_write(self):
+        """每次写入后文件都必须仍然合法 —— 这是整套审计不失真的前提。"""
+        R.record_evidence("w1", "a", path=self.path)
+        R.set_status("w1", "supported", note="b", path=self.path)
+        R.add_rule("w4", "又一条", path=self.path)
+        R.set_status("w4", "retired", path=self.path)
+        rules, _, _ = load_rules(path=self.path)
+        self.assertEqual([r.id for r in rules], ["w1", "w2", "w4"])
+        self.assertEqual(next(r for r in rules if r.id == "w4").status, "retired")
+
+
+class TestSetStatusRequiresApproval(unittest.TestCase):
+    def test_cli_refuses_without_approved_flag(self):
+        """改状态会改变这条规则能否指导真钱下单 —— CLI 必须拦住未批准的调用。"""
+        p = toml_file('''
+[[rule]]
+id        = "x1"
+statement = "x"
+kind      = "market"
+test      = { type = "manual", how = "h" }
+status    = "hypothesis"
+evidence  = []
+last_audited = ""
+''')
+        code = R.main(["--file", str(p), "--set-status", "x1", "supported"])
+        self.assertEqual(code, 1)
+        rules, _, _ = load_rules(path=p)
+        self.assertEqual(rules[0].status, "hypothesis", "未批准却被改了")
+
+    def test_cli_allows_with_approved_flag(self):
+        p = toml_file('''
+[[rule]]
+id        = "x2"
+statement = "x"
+kind      = "market"
+test      = { type = "manual", how = "h" }
+status    = "hypothesis"
+evidence  = []
+last_audited = ""
+''')
+        code = R.main(["--file", str(p), "--set-status", "x2", "supported", "--approved"])
+        self.assertEqual(code, 0)
+        rules, _, _ = load_rules(path=p)
+        self.assertEqual(rules[0].status, "supported")
+
+    def test_cli_record_evidence_needs_no_approval(self):
+        p = toml_file('''
+[[rule]]
+id        = "x3"
+statement = "x"
+kind      = "market"
+test      = { type = "manual", how = "h" }
+status    = "hypothesis"
+evidence  = []
+last_audited = ""
+''')
+        self.assertEqual(R.main(["--file", str(p), "--record-evidence", "x3", "事实一条"]), 0)
+        rules, _, _ = load_rules(path=p)
+        self.assertEqual(rules[0].evidence, ["事实一条"])

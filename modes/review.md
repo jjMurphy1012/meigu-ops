@@ -76,15 +76,24 @@ make dashboard                                 # 纪律页同样的审计,可视
 
 对每条被审计的规则:
 
-1. **追加 `evidence`** —— 一行,带日期、标的、结果。这是下次审计的输入。
-2. **更新 `last_audited`** 为今天。
-3. **必要时改 `status`**,并把理由写进 `evidence`。
+**全部用脚本改,不要手编 TOML:**
 
-改 `status` 需要**用户明确批准** —— 这是他的策略,不是你的。
-给出建议和依据,等他确认后再改文件。
+```bash
+# 1) 追加证据(免批准)
+python3 scripts/rules.py --record-evidence <id> "2026-08-19 …"
 
-若本期产生了**新的规则候选**(某个反复出现的判断值得固化),写成新的 `[[rule]]`,
-`status = "hypothesis"`,`evidence` 记下它从哪来。
+# 2) 改状态 —— 必须先得到用户明确批准,再加 --approved
+python3 scripts/rules.py --set-status <id> supported --approved --note "理由"
+
+# 3) 新增假设(默认 hypothesis → observe,只能用最低档尺寸)
+python3 scripts/rules.py --add-rule <id> "一句能被证伪的话"
+```
+
+`--set-status` 不带 `--approved` 会直接退出并提示 —— **状态变更改变的是这条规则
+能否指导真钱下单,那是用户的决定,不是你的**。先摆出数据与建议,等确认。
+
+降级为 `refuted` / `retired` 时脚本会自动把 `execution_scope` 设成 `none`,
+避免出现"状态说停用、作用域还在跑"的不一致。`last_audited` 也由脚本更新。
 
 ### 5.2 同步 `modes/_strategy.md`
 

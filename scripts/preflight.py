@@ -65,7 +65,7 @@ GATE_NAMES = (
     "意图时效",
     "报价时间戳熔断",
     "理由标签",
-    "规则作用域",
+    "依据强度与尺寸",
     "单笔金额上限",
     "减仓占比",
     "残值仓",
@@ -394,61 +394,92 @@ def check_concentration_and_bp(r: Result, cfg: dict, order: dict) -> None:
         )
 
 
-def check_rule_scope(r: Result, order: dict) -> None:
-    """规则作用域 —— 未经数据支持的假设不能单独授权真钱下单。
+def rule_size_tier(rule, summary: dict, ex: dict) -> tuple[float, str]:
+    """一条规则允许多大的尺寸系数,以及理由。
 
-    订单可用 `rule_ids` 声明本笔依据了哪些规则。若引用的规则全部处于 `observe`
-    (通常是零样本的 hypothesis),这笔单不能自动放行 —— 否则系统会拿真钱去试
-    一条刚写出来、从没被检验过的规则。
+    证据强度决定**仓位大小**,不决定能不能交易 —— 否则第一天就死锁:
+    没有数据 → 不许交易 → 永远攒不到验证规则所需的数据。
     """
+    from rules import MODERATE, STRONG, SUPPORTS, WEAK, audit_rule
+
+    observe = float(ex.get("size_scale_observe", 0.4))
+    weak = float(ex.get("size_scale_weak", 0.7))
+    supported = float(ex.get("size_scale_supported", 1.0))
+
+    if rule.scope == "none":
+        return 0.0, f"{rule.id} 已停用({rule.status})"
+    if rule.kind == "process":
+        return supported, f"{rule.id} 流程纪律"
+
+    v = audit_rule(rule, summary)
+    if v.result == SUPPORTS and v.confidence in (MODERATE, STRONG):
+        return supported, f"{rule.id} 数据支持({v.samples} 事件)"
+    if v.result == SUPPORTS and v.confidence == WEAK:
+        return weak, f"{rule.id} 弱支持({v.samples} 事件)"
+    if rule.status == "supported":
+        return supported, f"{rule.id} 你已批准升为 supported"
+    return observe, f"{rule.id} 观察期({v.samples} 事件)"
+
+
+def check_rule_scope_and_size(r: Result, cfg: dict, order: dict) -> None:
+    """按依据规则的证据强度自动缩放单笔上限。
+
+    · 未声明 rule_ids → 按最低档(无法核实依据,就不能给更大尺寸)
+    · 声明多条 → 取其中**最强**的一条(引用额外的弱上下文不该受罚)
+    · 引用已停用(refuted / retired)的规则 → 直接拒绝
+    """
+    ex = cfg.get("execution", {})
+    observe_scale = float(ex.get("size_scale_observe", 0.4))
+    cap = float(ex.get("max_order_usd", 80))
+    amount = _order_amount(order) or 0.0
     ids = [str(x) for x in (order.get("rule_ids") or [])]
+
     if not ids:
+        allowed = cap * observe_scale
         r.add(
-            "规则作用域",
-            False,
-            "订单未声明 rule_ids —— 无法核实依据的规则是否已被数据支持",
-            fatal=False,
-            hint="在订单里写上本笔依据的规则 id,preflight 才能挡住『拿真钱试新假设』。",
+            "依据强度与尺寸",
+            amount <= allowed,
+            f"未声明 rule_ids → 按最低档 ×{observe_scale:g}:上限 ${allowed:.2f}"
+            f"(本笔 ${amount:.2f})",
+            hint=f"把金额降到 ${allowed:.2f} 以内即可放行;"
+                 f"或在订单里声明 rule_ids —— 依据已被数据支持的规则可以拿更大尺寸。",
         )
         return
+
     try:
         from rules import load_rules
+        from stats import summarize
 
         rules, _, _ = load_rules()
+        summary = summarize(parse_trades())
     except Exception as exc:                      # noqa: BLE001
-        r.add("规则作用域", False, f"规则文件无法加载:{exc}", fatal=False)
+        r.add("依据强度与尺寸", False, f"无法加载规则或台账:{exc}", fatal=False)
         return
 
     by_id = {x.id: x for x in rules}
     unknown = [i for i in ids if i not in by_id]
     if unknown:
-        r.add("规则作用域", False, f"引用了不存在的规则 id:{unknown}",
+        r.add("依据强度与尺寸", False, f"引用了不存在的规则 id:{unknown}",
               hint="检查 config/rules.toml,或跑 make rules-check。")
         return
 
-    cited = [by_id[i] for i in ids]
-    live = [x for x in cited if x.may_authorize_live]
-    dead = [x for x in cited if x.scope == "none"]
-
+    tiers = [rule_size_tier(by_id[i], summary, ex) for i in ids]
+    dead = [why for scale, why in tiers if scale == 0.0]
     if dead:
-        r.add("规则作用域", False,
-              f"引用了已停用的规则:{[x.id for x in dead]}",
+        r.add("依据强度与尺寸", False, f"引用了已停用的规则:{dead}",
               hint="refuted / retired 的规则只保留历史,不参与决策。")
         return
-    if live:
-        r.add("规则作用域", True,
-              f"依据 {len(live)}/{len(cited)} 条已支持的规则:{[x.id for x in live]}")
-        return
 
-    approved = bool(order.get("user_approved"))
+    best_scale, best_why = max(tiers, key=lambda x: x[0])
+    allowed = cap * best_scale
     r.add(
-        "规则作用域",
-        approved,
-        f"全部依据处于观察期:{[x.id for x in cited]}"
-        + ("(已获用户显式批准)" if approved else ""),
-        hint="观察期规则不能单独授权真钱下单。要么等它被数据支持,"
-             "要么由用户显式批准并缩小尺寸(订单里加 user_approved=true)。"
-        if not approved else "",
+        "依据强度与尺寸",
+        amount <= allowed,
+        f"最强依据 {best_why} → ×{best_scale:g},上限 ${allowed:.2f}(本笔 ${amount:.2f})",
+        hint=f"把金额降到 ${allowed:.2f} 以内即可放行 —— "
+             f"仓位随证据积累自动放大,不需要人工调整。"
+        if amount > allowed
+        else "",
     )
 
 
@@ -554,7 +585,7 @@ def run(order: dict, cfg: dict, now: dt.datetime | None = None, vocab=None) -> R
     check_intent_freshness(r, cfg, order, now)
     check_quote_timestamp(r, cfg, order, now)
     check_reason_tag(r, order, vocab)
-    check_rule_scope(r, order)
+    check_rule_scope_and_size(r, cfg, order)
     check_size(r, cfg, order)
     check_concentration_and_bp(r, cfg, order)
     check_daily_limits(r, cfg, order)

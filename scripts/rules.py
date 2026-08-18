@@ -50,7 +50,14 @@ import tomllib
 from dataclasses import dataclass, field
 from pathlib import Path
 
-from meigu_lib import CONFIG_DIR, ROOT, ConfigError, load_vocabulary, rel_to_root
+from meigu_lib import (
+    CONFIG_DIR,
+    ROOT,
+    ConfigError,
+    load_vocabulary,
+    rel_to_root,
+    today_et,
+)
 
 # ---- 结论方向
 SUPPORTS = "supports"
@@ -413,11 +420,179 @@ def cross_check_strategy(rules: list[Rule]) -> list[str]:
     ]
 
 
+# ------------------------------------------------------------------- 写入命令
+# ★ 自我进化闭环的最后一环。
+#
+# 为什么要脚本写而不是让 agent 手改 TOML:手改会破坏格式、丢注释、写错字段名,
+# 而这个文件一旦坏掉,整套审计就静默失真 —— 你会以为规则被检验过,其实没有。
+#
+# 分工:
+#   --record-evidence  只追加事实,不改变任何行为 → agent 可自行执行(每日 journal)
+#   --set-status       改变规则能否指导下单 → **必须 --approved 显式声明用户已批准**
+#   --add-rule         新增假设,默认 hypothesis/observe → agent 可自行执行(复盘产出)
+
+def _rule_block_span(text: str, rule_id: str) -> tuple[int, int]:
+    """返回该规则 [[rule]] 块在原文中的起止字符位置。"""
+    lines = text.splitlines(keepends=True)
+    starts = [i for i, l in enumerate(lines) if l.strip() == "[[rule]]"]
+    for n, i in enumerate(starts):
+        end = starts[n + 1] if n + 1 < len(starts) else len(lines)
+        block = "".join(lines[i:end])
+        if f'id        = "{rule_id}"' in block or f'id = "{rule_id}"' in block:
+            return sum(len(x) for x in lines[:i]), sum(len(x) for x in lines[:end])
+    raise ConfigError(
+        f"找不到 id 为 {rule_id!r} 的规则。跑 `make rules-check` 看现有 id。"
+    )
+
+
+def _value_span(block: str, key: str) -> tuple[int, int]:
+    """返回块内 `key = ...` 的值起止位置(支持跨行数组)。"""
+    import re as _re
+
+    m = _re.search(rf"^\s*{_re.escape(key)}\s*=\s*", block, _re.M)
+    if not m:
+        raise ConfigError(f"该规则块里没有 {key} 字段")
+    start = m.end()
+    rest = block[start:]
+    if rest.lstrip().startswith("["):
+        depth, i = 0, rest.index("[")
+        for j in range(i, len(rest)):
+            if rest[j] == "[":
+                depth += 1
+            elif rest[j] == "]":
+                depth -= 1
+                if depth == 0:
+                    return start, start + j + 1
+        raise ConfigError(f"{key} 的数组没有闭合")
+    nl = rest.find("\n")
+    return start, start + (len(rest) if nl < 0 else nl)
+
+
+def _toml_str(s: str) -> str:
+    return '"' + s.replace("\\", "\\\\").replace('"', '\\"') + '"'
+
+
+def record_evidence(rule_id: str, text: str, path: Path | None = None) -> str:
+    """往规则的 evidence 追加一行。只追加事实,不改变行为,无需批准。"""
+    path = path or (CONFIG_DIR / "rules.toml")
+    raw = path.read_text(encoding="utf-8")
+    bs, be = _rule_block_span(raw, rule_id)
+    block = raw[bs:be]
+    vs, ve = _value_span(block, "evidence")
+    current = block[vs:ve].strip()
+
+    if current in ("[]", "[ ]"):
+        new_val = f"[{_toml_str(text)}]"
+    else:
+        inner = current[1:-1].rstrip()
+        sep = "" if inner.rstrip().endswith(",") or not inner else ","
+        new_val = f"[{inner}{sep} {_toml_str(text)}]"
+
+    updated = block[:vs] + new_val + block[ve:]
+    path.write_text(raw[:bs] + updated + raw[be:], encoding="utf-8")
+    return f"已为 {rule_id} 追加一条证据"
+
+
+def set_status(rule_id: str, status: str, note: str = "",
+               path: Path | None = None) -> str:
+    """改规则状态。**改变的是它能否指导真钱下单**,所以必须用户批准。"""
+    if status not in VALID_STATUS:
+        raise ConfigError(f"status 必须是 {'/'.join(VALID_STATUS)}")
+    path = path or (CONFIG_DIR / "rules.toml")
+    raw = path.read_text(encoding="utf-8")
+    bs, be = _rule_block_span(raw, rule_id)
+    block = raw[bs:be]
+
+    vs, ve = _value_span(block, "status")
+    old = block[vs:ve].strip().strip('"')
+    block = block[:vs] + _toml_str(status) + block[ve:]
+
+    # 降级为 refuted/retired 时同步停用,避免"状态说停用、作用域还在跑"
+    if status in ("refuted", "retired"):
+        try:
+            svs, sve = _value_span(block, "execution_scope")
+            block = block[:svs] + _toml_str("none") + block[sve:]
+        except ConfigError:
+            block = block.rstrip("\n") + '\nexecution_scope = "none"\n'
+
+    try:
+        avs, ave = _value_span(block, "last_audited")
+        block = block[:avs] + _toml_str(today_et().isoformat()) + block[ave:]
+    except ConfigError:
+        pass
+
+    path.write_text(raw[:bs] + block + raw[be:], encoding="utf-8")
+    msg = f"{rule_id}: {old} → {status}"
+    if note:
+        record_evidence(rule_id, f"[{today_et().isoformat()}] {old}→{status}: {note}", path)
+    return msg
+
+
+def add_rule(rule_id: str, statement: str, kind: str = "market",
+             test: str = "", path: Path | None = None) -> str:
+    """新增一条假设。默认 hypothesis(→ observe),不能直接指导满额下单。"""
+    path = path or (CONFIG_DIR / "rules.toml")
+    raw = path.read_text(encoding="utf-8")
+    try:
+        _rule_block_span(raw, rule_id)
+        raise ConfigError(f"id {rule_id!r} 已存在")
+    except ConfigError as exc:
+        if "已存在" in str(exc):
+            raise
+    test_line = test or '{ type = "manual", how = "复盘时人工核查(待补:怎么查)" }'
+    block = f"""
+
+[[rule]]
+id        = {_toml_str(rule_id)}
+statement = {_toml_str(statement)}
+kind      = {_toml_str(kind)}
+test      = {test_line}
+status    = "hypothesis"
+evidence  = []
+last_audited = ""
+"""
+    path.write_text(raw.rstrip("\n") + block, encoding="utf-8")
+    return f"已新增 {rule_id}(hypothesis → observe,尺寸按最低档)"
+
+
 def main(argv: list[str] | None = None) -> int:
     ap = argparse.ArgumentParser(description="校验 config/rules.toml")
     ap.add_argument("--file", help="指定规则文件")
     ap.add_argument("--strict", action="store_true", help="散文不同步也算失败")
+    ap.add_argument("--record-evidence", nargs=2, metavar=("ID", "TEXT"),
+                    help="往某条规则追加一行证据(只记事实,无需批准)")
+    ap.add_argument("--set-status", nargs=2, metavar=("ID", "STATUS"),
+                    help="改规则状态 —— 需 --approved")
+    ap.add_argument("--note", default="", help="配合 --set-status 记录理由")
+    ap.add_argument("--approved", action="store_true",
+                    help="声明本次状态变更已获用户明确批准")
+    ap.add_argument("--add-rule", nargs=2, metavar=("ID", "STATEMENT"),
+                    help="新增一条假设(默认 hypothesis → observe)")
+    ap.add_argument("--kind", default="market", help="配合 --add-rule")
     args = ap.parse_args(argv)
+
+    target = Path(args.file) if args.file else None
+    try:
+        if args.record_evidence:
+            print("✅ " + record_evidence(*args.record_evidence, path=target))
+            return 0
+        if args.add_rule:
+            print("✅ " + add_rule(args.add_rule[0], args.add_rule[1],
+                                  kind=args.kind, path=target))
+            return 0
+        if args.set_status:
+            if not args.approved:
+                print("❌ 改状态会改变这条规则能否指导真钱下单 —— 需要用户明确批准。",
+                      file=sys.stderr)
+                print("   先向用户说明依据与建议,得到确认后再加 --approved 重跑。",
+                      file=sys.stderr)
+                return 1
+            print("✅ " + set_status(args.set_status[0], args.set_status[1],
+                                     note=args.note, path=target))
+            return 0
+    except ConfigError as exc:
+        print(f"❌ {exc}", file=sys.stderr)
+        return 1
 
     try:
         rules, src, is_example = load_rules(path=Path(args.file) if args.file else None)

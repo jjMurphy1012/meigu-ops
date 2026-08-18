@@ -12,7 +12,7 @@
 <p align="center">
   <img src="https://img.shields.io/badge/Python-3.11+-3776AB?style=flat&logo=python&logoColor=white" alt="Python 3.11+">
   <img src="https://img.shields.io/badge/dependencies-none-2ea44f?style=flat" alt="Zero dependencies">
-  <img src="https://img.shields.io/badge/tests-244%20passing-2ea44f?style=flat" alt="244 tests">
+  <img src="https://img.shields.io/badge/tests-261%20passing-2ea44f?style=flat" alt="261 tests">
   <a href="https://claude.com/claude-code"><img src="https://img.shields.io/badge/Built_with-Claude_Code-000?style=flat&logo=anthropic&logoColor=white" alt="Built with Claude Code"></a>
   <img src="https://img.shields.io/badge/License-MIT-blue.svg" alt="MIT">
   <a href="DISCLAIMER.md"><img src="https://img.shields.io/badge/%E2%9A%A0%EF%B8%8F-not_investment_advice-critical" alt="Not investment advice"></a>
@@ -77,7 +77,7 @@ won't be worse than last time's.**
 | **Strategy layer fully private** | Tag vocabulary, rules, prose strategy, account params are all gitignored. The repo ships only `*.example.*` templates — question lists with zero answers |
 | **Rules audited by data** | Write discipline as falsifiable entries; `make stats` decides whether your ledger supports them. **A rule never supported by data is baggage, not an asset** |
 | **The audit refuses sloppy conclusions** | Direction and confidence are separate: < 10 decision events → no conclusion; 10–19 → "weakly supports/refutes" only; ≥ 20 → may *suggest* a status change — and every change needs your approval |
-| **New hypotheses can't risk real money** | Execution scope is orthogonal to status: `hypothesis` defaults to `observe`, and preflight blocks orders whose entire justification is still under observation |
+| **Position size scales with evidence** | Evidence strength governs **size**, not whether you may trade — otherwise day one deadlocks (no data → no trading → never accumulate data). Unvalidated hypotheses run at 40% size, weak support 70%, supported full. **Fully automatic; no manual downsizing** |
 | **Sample unit is the decision event** | One sell matched against three historical buy lots is still **one** exit decision — not three samples |
 | **Deterministic order gates** | `preflight.py` turns intent TTL, broker-quote-timestamp fuse, reduce-percentage, concentration, daily caps, and `ref_id` dedup into a **program**, returning `ALLOW`/`DRY_RUN`/`DENY` |
 | **Execution off by default** | `execution.enabled = false` is the repository default — cloning inherits nobody's authorization. Authorization is a local fact |

@@ -125,8 +125,15 @@ make stats           # 台账统计(FIFO 实现盈亏 / 胜率 / 标签分布)
 make preflight-example  # 订单 JSON 模板
 make preflight       # ★ 下单前置检查 → ALLOW / DRY_RUN / DENY
 make dashboard       # 只读仪表盘 TUI(组合 / 台账 / 纪律审计)
+make rules-check     # 规则格式 / 标签引用 / 闸门引用 / 散文同步
+python3 scripts/rules.py --record-evidence <id> "…"   # 每日记证据(免批准)
+python3 scripts/rules.py --set-status <id> supported --approved   # 改状态(需用户批准)
 make check-privacy   # 提交前隐私检查
 ```
 
 **下单必经 `preflight`。** 它返回 `DENY` 就是不许下,不得绕过或"人工判断通过"
 (详见 `modes/trade.md` Step 1)。
+
+**订单要写 `rule_ids`** —— 本笔依据了 `config/rules.toml` 的哪几条规则。
+尺寸随证据强度自动缩放:未声明或依据仍在观察期按最低档,依据已被数据支持的规则可满额。
+超限时 preflight 会直接给出允许金额,按那个数重下即可 —— **不需要人工换算**。

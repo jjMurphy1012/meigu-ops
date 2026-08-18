@@ -450,12 +450,27 @@ if __name__ == "__main__":
 class TestRuleScope(unittest.TestCase):
     """★ 未经数据支持的假设不能单独授权真钱下单。"""
 
-    def test_missing_rule_ids_is_warning_only(self):
-        r = run(order(), cfg(), NOON, vocab=TEST_VOCAB)
-        self.assertIn("规则作用域", {c.name for c in r.warnings})
-        self.assertEqual(r.verdict, ALLOW)
+    def test_missing_rule_ids_scales_size_down(self):
+        """未声明依据 = 无法核实 = 按最低档尺寸。不能再靠"不声明"拿满额。"""
+        c = cfg(execution={"max_order_usd": 80, "size_scale_observe": 0.4})
+        # 80 × 0.4 = 32:$30 放行
+        self.assertEqual(run(order(amount_usd=30.0), c, NOON, vocab=TEST_VOCAB).verdict, ALLOW)
+        # $40 超过 32 → 拒绝,并给出允许金额
+        r = run(order(amount_usd=40.0, position={"market_value": 400.0}),
+                c, NOON, vocab=TEST_VOCAB)
+        self.assertEqual(r.verdict, DENY)
+        detail = next(x.detail for x in r.checks if x.name == "依据强度与尺寸")
+        self.assertIn("32.00", detail)
+
+    def test_scaling_is_automatic_not_manual(self):
+        """超限时必须直接给出允许金额 —— 自动化流程不能要求人工换算。"""
+        r = run(order(amount_usd=40.0, position={"market_value": 400.0}),
+                cfg(execution={"max_order_usd": 80, "size_scale_observe": 0.4}),
+                NOON, vocab=TEST_VOCAB)
+        hint = next(x.hint for x in r.checks if x.name == "依据强度与尺寸")
+        self.assertIn("$32.00", hint)
 
     def test_unknown_rule_id_denies(self):
         r = run(order(rule_ids=["根本不存在的规则"]), cfg(), NOON, vocab=TEST_VOCAB)
         self.assertEqual(r.verdict, DENY)
-        self.assertIn("规则作用域", names_failed(r))
+        self.assertIn("依据强度与尺寸", names_failed(r))

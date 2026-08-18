@@ -38,6 +38,11 @@ preflight: ## 下单前置检查(从 stdin 读订单 JSON,返回 ALLOW/DRY_RUN/D
 rules-check: ## 校验 config/rules.toml(id/标签/闸门/散文同步)
 	@$(PY) $(S)/rules.py
 
+# 自我进化的写回:证据免批准,改状态需 --approved
+#   python3 scripts/rules.py --record-evidence <id> "…"
+#   python3 scripts/rules.py --set-status <id> supported --approved --note "…"
+#   python3 scripts/rules.py --add-rule <id> "一句能被证伪的话"
+
 preflight-example: ## 打印订单 JSON 模板
 	@$(PY) $(S)/preflight.py --example
 

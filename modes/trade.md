@@ -47,6 +47,14 @@ echo '{...}' | python3 scripts/preflight.py --stdin --json
 | `ref_id` 格式与去重 | 重复下单 |
 | 理由标签合法性 | 台账统计被脏数据污染 |
 
+**★ 订单里要写 `rule_ids`** —— 本笔依据了 `config/rules.toml` 里的哪几条规则。
+
+尺寸随证据强度自动缩放(`size_scale_*`):未声明或依据仍在观察期 → 按最低档;
+依据已被数据支持的规则 → 满额。**不需要人工缩小尺寸** —— 超限时 preflight 会
+直接告诉你允许的金额,按那个数重下即可。
+
+引用 `refuted` / `retired` 的规则会被直接拒绝。
+
 **判定含义:**
 
 - `ALLOW` → 继续 Step 2。若 `require_confirmation = true`,仍需等用户确认。
