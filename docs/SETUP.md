@@ -6,7 +6,7 @@
 |---|---|---|
 | Python | **3.11+** | 脚本层。用 `tomllib` 读配置,**无任何第三方依赖** |
 | 一个 AI 编码 CLI | — | Claude Code 有原生 skill 路由;其他 CLI 靠 `AGENTS.md` + 自然语言指定 mode(见 §4) |
-| 券商 MCP server | — | 实时行情、持仓、下单。可选:不接也能用日报与复盘部分 |
+| 券商 MCP server | — | 实时行情、持仓、下单。**接入是 setup 第 2 步**;只想看效果可走 Demo 分支 |
 | macOS | — | 仅 `doctor` 的防休眠检查依赖 macOS,其他跨平台 |
 
 ```bash
@@ -15,17 +15,60 @@ python3 --version   # 需要 >= 3.11
 
 ---
 
-## 1. 克隆与自检
+## 1. 克隆,然后交给状态机
 
 ```bash
 git clone https://github.com/jjMurphy1012/meigu-ops.git
 cd meigu-ops
-make doctor
+make setup
 ```
 
-首次运行 `doctor` 一定会报 `config/profile.toml` 缺失——这是预期的,下一步就是配它。
+`make setup` 会告诉你当前处于哪一步、下一步该做什么。**下面各节是它每一步的展开,
+不是需要你手动照抄的顺序** —— 以 `make setup` 的输出为准。
 
-## 2. 配置
+### 顺序原则:连接要早、只读;授权要晚、单独
+
+```
+UNINITIALIZED → MCP_CONNECTED_READONLY → PROFILE_READY
+              → STRATEGY_READY → AUTOMATION_READY → LIVE_AUTHORIZED
+```
+
+这个项目的核心是"AI + 券商 MCP 自动交易"。**所以券商连接排在第二步,而不是最后一步**:
+若把它放到最后,你会配置半天才发现账户、权限或 MCP 根本不可用 —— 而那时 MCP 的问题
+和项目配置的问题已经混在一起,分不清是谁的错。
+
+但**连接成功不等于获得真钱执行权限**。第二步是纯只读的:读账户、持仓、买力、报价,
+`place_equity_order` 一次都不会被调用。真钱授权是最后一步,单独做。
+
+**状态是算出来的,不是记下来的。** 改了账户号、删了规则文件、规则文件读不出来,
+`make setup` 会自动落回那一步。
+
+```bash
+make setup-checklist   # 看每一步的验收项
+```
+
+### 只想看效果?不必授权券商
+
+```bash
+make dashboard-demo
+python3 scripts/stats.py --demo
+```
+
+用虚构固件跑完整工作流,不需要任何账户。
+
+---
+
+## 2. 券商 MCP 只读验证(状态机第 2 步)
+
+装好并登录 Robinhood MCP 后,跑 `/meigu-ops setup`,由 AI 执行只读调用:
+读账户列表 → 在其中定位你的子账户(且账户号唯一)→ 读持仓 → 读 buying power
+→ 取**带时间戳**的报价 → 确认 `review_equity_order` 可调用。
+
+**验收标准是真的读到数据,不是"检测到 MCP 配置文件"。** 九项逐条校验,缺一不可;
+读到的账户号与 `config/profile.toml` 不一致会**直接拒绝**,不会替你选一个;
+验证期间执行开关若是开着的,也会被拒绝 —— "只读"必须名副其实。
+
+## 3. 配置(状态机第 3 步)
 
 ```bash
 cp config/profile.example.toml  config/profile.toml
@@ -38,40 +81,62 @@ cp config/watchlist.example.toml config/watchlist.toml
 
 ```toml
 [account]
-id = "你的下单子账户号"      # 主账户只读,不填这里
-display_last4 = "后4位"      # 汇报和日报里只露这个
-type = "cash"                # cash 的卖出资金 T+1 结算,会影响当日可用买力
+id = "刚刚验证过的下单子账户号"   # 主账户只读,不填这里
+display_last4 = "后4位"          # 汇报和日报里只露这个
+type = "cash"                    # cash 的卖出资金 T+1 结算,会影响当日可用买力
 
-[trade]
-size_std = 50                # 单笔标准尺寸
-size_max = 80                # 极强信号的单笔上限
-
-[cash]
-bp_target_pct = 20           # 常态目标:buying power 占总值 < 这个 %
+[execution]                      # 四条硬上限:不随证据强度变化,任何规则都绕不过
+max_order_usd = 80               # 单笔
+max_daily_usd = 200              # 单日**买入**累计(卖出不受此限)
+max_orders_per_day = 6
+kill_switch_file = "data/HALTED"
 ```
 
-其余参数都有合理默认值,可以先跑起来再调。每项的含义都写在样例文件的注释里。
+按"单日全损也能承受"的量级来定这四个数。此时执行开关仍全部关闭 ——
+**这一步只是配置,不是授权。**
 
-> ⚠️ **`config/profile.example.toml` 里的账户号是占位值 `000000000`。**
-> 脚本会检测到你在用样例配置并拒绝执行下单相关流程。
+> ⚠️ 样例里的账户号是占位值。状态机检测到占位值就不会放行下一步。
 
 ### `config/watchlist.toml`
 
-按你自己的主线改 `[[groups]]`。日报 §12 和盘前候选扫描都从这里读——
+按你自己的主线改 `[[groups]]`。日报与盘前候选扫描都从这里读——
 **换主线只改这个文件,纪律手册一行都不用动。**
 
-## 3. 验证
+## 4. 你自己的策略(状态机第 4 步)
+
+```bash
+cp config/reason-tags.example.toml config/reason-tags.toml
+cp config/rules.example.toml        config/rules.toml
+cp modes/_strategy.example.md       modes/_strategy.md
+```
+
+**这是最花时间、也是唯一不能让 AI 替你做的一步。**
+`modes/_strategy.example.md` 里全是问题,没有答案 —— 本仓库不提供任何交易策略。
+
+没有市场判断类规则时,系统只能跑分析与 dry-run,不能下真单。**这是设计如此。**
+
+```bash
+make rules-check     # 格式、标签引用、闸门引用
+```
+
+## 5. 演练与验证(状态机第 5 步)
 
 ```bash
 make doctor          # 应该只剩防休眠类的提醒
-make test            # 217 个测试应全绿
+make test            # 295 个测试应全绿
 make trading-day     # 今天是不是交易日
 make report          # 生成 reports/{今天}.md 骨架
 ```
 
+确认 `dry_run = true`,然后完整跑一遍:盘前 → 盘中 → preflight → 模拟下单
+(走完 `review`,**不 `place`**)→ 尾盘日志 → 复盘。
+
+演练的意义是把"配置对不对"和"链路通不通"分开验证。**链路没跑通就开真钱,
+出问题时你分不清是策略错了还是管道漏了。**
+
 ---
 
-## 4. AI CLI 接入
+## 6. AI CLI 接入
 
 ### Claude Code
 
@@ -100,9 +165,9 @@ make report          # 生成 reports/{今天}.md 骨架
 
 ---
 
-## 5. 券商 MCP 与下单权限(可选)
+## 7. 会话与机器层面的前置条件
 
-只有要自动下单才需要这一节。**下单前请先读 `DISCLAIMER.md`。**
+券商 MCP 只读验证能过,不代表无人值守跑得起来。这一节的两件事都曾真实造成损失。
 
 ### 权限白名单——这一层不通会冻结整个会话
 
@@ -164,21 +229,24 @@ sudo pmset -a disablesleep 1
 
 ---
 
-## 6. 日常使用
+## 8. 授权真钱执行(状态机第 6 步)
 
-### 下单授权(默认关闭)
+**下单前请先读 `DISCLAIMER.md`。**
 
-`config/profile.toml` 的 `[execution]` 默认 `enabled = false` —— **clone 这个仓库不会
-继承任何人的下单授权**。要下真单,依次放开:
+`[execution]` 默认 `enabled = false` —— **clone 这个仓库不会继承任何人的下单授权。**
+前五步全部通过后,用脚本授权,不要手改配置:
 
-```toml
-[execution]
-enabled = true              # ① 总开关
-dry_run = false             # ② 关掉演练模式
-require_confirmation = true  # ③ 建议先保留逐笔确认,跑顺了再考虑关
-max_order_usd = 80          # 硬上限由 preflight 强制
-max_daily_usd = 200
+```bash
+# 先用 guarded:仓位统一压到最低档,不管规则状态多好
+python3 scripts/setup.py --authorize-live guarded --approved
+
+# 跑一段、确认健康之后,再考虑放开仓位缩放
+python3 scripts/setup.py --authorize-live autonomous --approved
 ```
+
+不带 `--approved` 会直接退出;前五步没全过也会被拒绝。
+
+**"开不开真钱"与"放不放开仓位"是两个独立决定。** 不要一次做完。
 
 `touch data/HALTED` 可立即停手(preflight 会一律 DENY),删掉该文件恢复。
 
@@ -193,6 +261,8 @@ python3 scripts/preflight.py --order-file /tmp/order.json
 返回 `DENY` 就是不许下 —— 不得绕过。详见 `modes/trade.md` Step 1。
 
 ---
+
+## 9. 日常使用
 
 ### 仪表盘
 
@@ -232,7 +302,7 @@ make test              # 改了脚本之后
 make help              # 列出全部命令
 ```
 
-## 7. 常见问题
+## 10. 常见问题
 
 **Q:`doctor` 报 `config/profile.toml` 缺失并非零退出,是坏了吗?**
 A:不是。全新 clone 尚未配置时这是**预期行为** —— doctor 的职责就是在你开始工作前
