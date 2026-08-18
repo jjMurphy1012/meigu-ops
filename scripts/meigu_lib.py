@@ -314,17 +314,33 @@ def trading_days_between(start: dt.date, end: dt.date) -> int:
     return count
 
 
+def et_tz():
+    """美东时区对象。
+
+    ★ Windows 没有系统时区数据库,`ZoneInfo("America/New_York")` 会直接抛
+    `ZoneInfoNotFoundError` —— 而本项目的每一个时间判断都依赖它。
+    这里把那个晦涩的异常翻译成一句能照做的话:装标准库的伴生包 `tzdata`。
+    (这是本项目唯一一个平台相关的依赖,且只有 Windows 需要。)
+    """
+    from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
+
+    try:
+        return ZoneInfo(ET)
+    except ZoneInfoNotFoundError as exc:
+        raise ConfigError(
+            f"找不到时区数据库({ET})—— 本项目的所有时间判断都基于 ET,不能退回本机时区。\n"
+            f"  Windows 没有自带时区库,装一次即可:  pip install tzdata\n"
+            f"  macOS / Linux 出现这个错误通常说明 Python 安装不完整。"
+        ) from exc
+
+
 def today_et() -> dt.date:
     """ET 当前日期 —— 绝不用本机时区,本机时钟会漂移(见 modes/_mechanics.md §4)。"""
-    from zoneinfo import ZoneInfo
-
-    return dt.datetime.now(ZoneInfo(ET)).date()
+    return dt.datetime.now(et_tz()).date()
 
 
 def now_et() -> dt.datetime:
-    from zoneinfo import ZoneInfo
-
-    return dt.datetime.now(ZoneInfo(ET))
+    return dt.datetime.now(et_tz())
 
 
 WEEKDAY_ZH = ("周一", "周二", "周三", "周四", "周五", "周六", "周日")

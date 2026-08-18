@@ -12,7 +12,7 @@
 <p align="center">
   <img src="https://img.shields.io/badge/Python-3.11+-3776AB?style=flat&logo=python&logoColor=white" alt="Python 3.11+">
   <img src="https://img.shields.io/badge/dependencies-none-2ea44f?style=flat" alt="Zero dependencies">
-  <img src="https://img.shields.io/badge/tests-357%20passing-2ea44f?style=flat" alt="357 tests">
+  <img src="https://img.shields.io/badge/tests-358%20passing-2ea44f?style=flat" alt="358 tests">
   <a href="https://claude.com/claude-code"><img src="https://img.shields.io/badge/Built_with-Claude_Code-000?style=flat&logo=anthropic&logoColor=white" alt="Built with Claude Code"></a>
   <img src="https://img.shields.io/badge/License-MIT-blue.svg" alt="MIT">
   <a href="DISCLAIMER.md"><img src="https://img.shields.io/badge/%E2%9A%A0%EF%B8%8F-%E4%B8%8D%E6%9E%84%E6%88%90%E6%8A%95%E8%B5%84%E5%BB%BA%E8%AE%AE-critical" alt="Not investment advice"></a>
@@ -23,9 +23,13 @@
 </p>
 
 <p align="center">
-  <sub>演示里的每一个数字、每一个标签都是虚构占位(<code>examples/</code> 固件)。<br>
+  <sub>顺序就是新用户 clone 之后的真实顺序:<br>
+  <strong>①</strong> 接入状态机告诉你现在在第几步 · <strong>②</strong> 第 2 步的九项验收(全程只读,不调用 <code>place</code>)<br>
+  <strong>③</strong> 仪表盘三页:组合 / 台账(含 FIFO 配对)/ 纪律审计 · <strong>④</strong> 下单闸门真的拦住一笔<br><br>
   最后一段重放了一次真实事故形态:意图「部分减仓」,但仓位已缩水到只剩一个标准尺寸 ——
-  闸门算出会卖掉 <strong>90.9%</strong>,拒绝下单。</sub>
+  闸门算出会卖掉 <strong>90.9%</strong>,拒绝下单。<br>
+  演示里的每一个数字、每一个标签、连账户号都是虚构占位
+  (<code>examples/</code> 与 <code>demo/</code> 固件;测试强制录制脚本不得读真实配置)。</sub>
 </p>
 
 ---
@@ -94,6 +98,93 @@
 
 它不预测市场。它做的是另一件事:**保证今天的判断不会比上次做得更差。**
 
+## 它是怎么"自动"的
+
+**AI 在这五个时刻自己醒来、自己分析、自己决定买卖 —— 你可以不在场。**
+
+自动化的载体是 Claude Code 的会话级定时任务:每个检查点到点触发一次
+`/meigu-ops <mode>`,AI 读实时行情与持仓、跑完分析、过 `preflight` 闸门,
+够格就下单、不够格就明确说"今天不动"。
+
+### 为什么默认只有五个节点
+
+**这是个 token 预算问题,不是能力问题。**
+
+每个检查点都是一次完整的分析:读行情、读持仓、读新闻、比对规则、写结论。
+如果按"每 15 分钟看一眼"来排,**前几天就能把一个月的额度烧光** ——
+然后剩下的三周你一个检查点都跑不了。
+
+五个节点是权衡后的结果:开盘后一小时(波动消化完、信息相对完整)、
+午盘、尾盘前、加上盘前定方案与收盘写日志。它覆盖了一天里**信息密度最高**的几个时点,
+而不是把算力平摊在噪音上。
+
+> 初始化之后你可以自己加节点 —— 财报日、FOMC、CPI 这类事件按日历另设专项检查点
+> 是常见做法。**加之前先想清楚它花的 token 值不值那次判断。**
+
+### 自愈:掉了会自己回来
+
+会话级定时任务有两个特点:CLI 退出就丢,而且 7 天自动过期。
+所以 **9:12 的 `premarket` 每天做的第一件事就是核对另外四个节点是否还活着,
+掉了就重建。**
+
+自愈能生效的前提有三个,缺一不可:
+
+| 前提 | 为什么 |
+|---|---|
+| **会话窗口保持打开** | 定时任务是会话级的,CLI 退出即丢 |
+| **电脑接着电源** | 电池模式下系统会更激进地休眠 |
+| **电脑不进入休眠** | 睡着了就不会醒来执行 —— 同一笔减仓曾连续两天在 `review` 与 `place` 之间被休眠截杀 |
+
+macOS 上 `make doctor` 会替你检查这三项(`caffeinate` 是否常驻、是否在 AC 电源、
+`disablesleep` 是否开启)。**注意 `caffeinate` 挡不住物理合盖** ——
+交易时段要么保持开盖,要么 `sudo pmset -a disablesleep 1`。
+
+### 边界:这是"有人在场的自动化"
+
+说清楚它**不是**什么,比说它是什么更重要:
+
+❌ 不是无人值守 —— 会话窗口关了、电脑睡了,五个节点就不会触发
+❌ 仓库无法从代码层面阻止 agent 绕过 `preflight` 直接调用券商 MCP,
+   那一层只能靠 `.claude/settings.local.json` 的权限白名单
+❌ 打开 `execution.enabled` 只代表"这次运行里可以真下单",不等于全自动托管
+
+## 平台支持
+
+| | macOS | Windows | Linux |
+|---|---|---|---|
+| 全部脚本与闸门 | ✅ | ✅ | ✅ |
+| 仪表盘 TUI(`make dashboard`) | ✅ | ⚠️ 需 WSL 或 `windows-curses` | ✅ |
+| 仪表盘静态渲染(`--render`) | ✅ | ✅ | ✅ |
+| 防休眠自检(`make doctor`) | ✅ | ➖ 自动跳过,需自己在电源选项里关休眠 | ➖ 自动跳过 |
+| 时区数据库 | 系统自带 | **需 `pip install tzdata`** | 系统自带 |
+| `make` 命令 | 自带 | 需 WSL / Git Bash,或直接 `python scripts/xxx.py` | 自带 |
+
+**权限方面没有特殊要求:**不需要管理员权限,不写系统目录,不装后台服务
+(macOS 上的 `caffeinate` 是可选的防休眠措施,不是运行前提)。
+所有文件都在仓库目录内。唯一会写到仓库之外的是你自己配置的 Claude Code 设置。
+
+> Windows 上唯一的硬依赖是 `tzdata` —— 因为 Windows 没有系统时区数据库,
+> 而本项目**所有**时间判断都基于 ET,绝不退回本机时区(本机时钟漂移过,
+> 见 `modes/_mechanics.md`)。`make doctor` 会检查这一项并给出安装命令。
+
+## 它不碰什么
+
+**默认策略是稳定优先,不是收益优先。**
+
+| 不碰 | 原因 |
+|---|---|
+| **期权** | 时间价值衰减 + 杠杆效应,单次判断失误的代价与正股完全不是一个量级 |
+| **杠杆 / 融资** | 强平风险会把"判断错了"变成"退不出来了" |
+| **裸空** | 亏损理论上无上限 |
+
+系统只做**正股的买入与卖出**。所有闸门的默认取值都偏保守:
+单笔上限、单日累计、笔数上限、现金底线、集中度上限、未验证规则只给 40% 仓位。
+**默认不做冒险动作 —— 宁可错过,不可失控。**
+
+> 当然,这些都是你的配置。你完全可以写一套激进的规则、把上限调高、
+> 让仓位跑满。**系统不阻止你冒险,它只保证你冒的险是被记录、被检验、
+> 能被数据推翻的** —— 而不是一时冲动的结果。
+
 ## 核心特性
 
 | 特性 | 说明 |
@@ -108,7 +199,7 @@
 | **平台机制知识库** | `modes/_mechanics.md` 汇总 Robinhood MCP + Claude Code 会以什么方式把正确决策变成失败执行:结算、时间戳熔断、休眠截杀、时区漂移、权限弹窗冻结会话 |
 | **只读仪表盘 TUI** | 组合 / 台账 / 规则审计三页。curses,零依赖,整个 UI 是纯函数因此被测试完整覆盖 |
 | **日报骨架 config 驱动** | 指数、板块、主题、分组、风险维度全部来自你的配置。模板里没有任何行业或个股名 |
-| **零依赖** | Python 3.11+ 标准库。`tomllib` 读配置,`zoneinfo` 处理 ET |
+| **零依赖** | Python 3.11+ 标准库。`tomllib` 读配置,`zoneinfo` 处理 ET(Windows 需 `pip install tzdata`) |
 
 ## 快速开始
 
@@ -117,6 +208,23 @@ git clone https://github.com/jjMurphy1012/meigu-ops.git
 cd meigu-ops
 make setup        # ★ 从这里开始
 ```
+
+### 第一步:你自己动手连 Robinhood MCP
+
+**这一步 AI 替你做不了,也不该替你做。** 它需要你的券商账号登录 ——
+把登录凭据交给任何自动化流程都是错的,包括这个项目。
+
+在 Claude Code 里按 Robinhood MCP server 的官方说明**手动完成连接与登录**,
+然后回到会话里说一句"我连好了"。AI 接下来做的是**只读验证**:
+读账户列表、在其中定位你的子账户、读持仓、读买力、取一条带时间戳的报价、
+确认 `review_equity_order` 可调用 —— **全程不会调用 `place_equity_order`**。
+
+九项逐条核对,缺一不可;读到的账户号与 `config/profile.toml` 不一致会**直接拒绝**,
+不会替你猜一个。验收标准是**真的读到数据**,不是"检测到 MCP 配置文件"。
+
+> 为什么连券商排在第二步而不是最后一步:把它放到最后,你会先配半天,
+> 才发现账户或权限根本不可用 —— 而那时 MCP 的问题和项目配置的问题已经混在一起,
+> 分不清是谁的错。**但连接成功不等于获得下单权限**,那是第 6 步,单独授权。
 
 `make setup` 是一个**状态机**,它会告诉你当前处于哪一步、下一步该做什么:
 
@@ -130,10 +238,6 @@ make setup        # ★ 从这里开始
 ```
 
 **顺序是刻意的:连接要早、只读;授权要晚、单独。**
-
-把连券商放在最后,你会配置半天才发现账户或权限根本不可用 ——
-那时 MCP 的问题和项目配置的问题已经混在一起。但**连接成功不等于获得下单权限**:
-第 2 步全程只读,连 `place_equity_order` 都不会被调用。
 
 第 4 步是这个项目的重点。`modes/_strategy.example.md` 里全是问题、没有答案。
 起步建议:**先只写 2–3 条你最相信的规则** —— 十条没被检验过的规则,
@@ -170,6 +274,11 @@ make setup        # ★ 从这里开始
 
 也就是说:**你可以把"定策略"这件事交给 AI,但不能把"检验策略"这件事交出去。**
 检验只能由你的真实台账完成 —— 这恰恰是整个项目存在的理由。
+
+⚠️ **选这条路,风险由你自己承担。** AI 没有你的风险承受能力信息,不对结果负责,
+它提的规则也从未经过你的账户数据检验 —— 它只是从"当下的分析"出发的一个起点。
+这一点和你自己写的规则其实是同一个道理:**任何规则在被你的台账检验之前,
+都只是一个假设。** 区别只在于,你自己写的那条,你至少知道它从哪来。
 
 复盘时还能按 `origin` 分开看一个很值得问的问题:
 **我自己写的规则和 AI 代拟的规则,哪一类被数据推翻得更多?**

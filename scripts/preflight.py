@@ -1061,6 +1061,7 @@ def main(argv: list[str] | None = None) -> int:
     ap.add_argument("--json", action="store_true", help="JSON 输出")
     ap.add_argument("--now-et", help="覆盖当前 ET 时间(测试用),YYYY-MM-DD HH:MM")
     ap.add_argument("--tags", help="指定理由标签词表文件(演示/测试用,默认读 config/)")
+    ap.add_argument("--profile", help="指定配置文件(演示/测试用,默认读 config/profile.toml)")
     ap.add_argument("--example", action="store_true", help="打印订单 JSON 模板并退出")
     args = ap.parse_args(argv)
 
@@ -1086,7 +1087,16 @@ def main(argv: list[str] | None = None) -> int:
         print("\n模板:python3 scripts/preflight.py --example", file=sys.stderr)
         return 2
 
-    cfg = load_config("profile", required=False)
+    if args.profile:
+        # 演示/测试用:不读真实 config/profile.toml。
+        # 录制 gif 时这不是可选项 —— 真实配置里的账户号会被录进公开仓。
+        import tomllib
+
+        with Path(args.profile).open("rb") as fh:
+            cfg = tomllib.load(fh)
+        cfg["_source"] = args.profile
+    else:
+        cfg = load_config("profile", required=False)
     try:
         now = _parse_et(args.now_et, "--now-et") or now_et()
     except ValueError as exc:

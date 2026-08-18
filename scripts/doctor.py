@@ -89,6 +89,18 @@ def check_python(r: Result) -> None:
     )
 
 
+def check_tzdata(r: Result) -> None:
+    """时区数据库是否可用 —— Windows 上这是唯一需要额外安装的东西。"""
+    try:
+        from zoneinfo import ZoneInfo
+
+        ZoneInfo("America/New_York")
+        r.add("时区数据库", True, "America/New_York 可用")
+    except Exception:                             # noqa: BLE001
+        r.add("时区数据库", False, "找不到 America/New_York",
+              "Windows 没有自带时区库:pip install tzdata。所有时间判断都依赖它。")
+
+
 def check_clock(r: Result) -> None:
     """时钟漂移 —— 2026-07-13 系统时区从 ET 漂到 MDT,全部 cron 错位 2 小时。"""
     local = dt.datetime.now().astimezone()
@@ -346,6 +358,7 @@ def main(argv: list[str] | None = None) -> int:
     r = Result()
     for fn in (
         check_python,
+        check_tzdata,
         check_setup_state,
         check_clock,
         check_trading_day,

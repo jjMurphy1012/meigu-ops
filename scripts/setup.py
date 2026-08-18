@@ -313,22 +313,26 @@ def check_profile() -> Step:
                 if not todo else "配置不完整", todo)
 
 
-def check_strategy() -> Step:
+def check_strategy(rules_path: Path | None = None, vocab_path: Path | None = None) -> Step:
     todo = []
     for f, hint in (
         ("config/reason-tags.toml", "cp config/reason-tags.example.toml config/reason-tags.toml"),
         ("config/rules.toml", "cp config/rules.example.toml config/rules.toml"),
         ("modes/_strategy.md", "cp modes/_strategy.example.md modes/_strategy.md"),
     ):
+        if rules_path is not None:
+            continue                              # demo 模式:策略层由固件提供
         if not (ROOT / f).exists():
             todo.append(f"{f} 不存在 —— {hint}")
     if todo:
         return Step(STRATEGY_READY, False, "策略层尚未建立", todo)
 
     try:
+        from meigu_lib import load_vocabulary
         from rules import load_rules
 
-        rules, _, _ = load_rules()
+        vocab = load_vocabulary(path=vocab_path) if vocab_path else None
+        rules, _, _ = load_rules(path=rules_path, vocab=vocab)
     except Exception as exc:                      # noqa: BLE001
         return Step(STRATEGY_READY, False, f"规则文件有问题:{exc}", ["跑 make rules-check"])
 
@@ -380,7 +384,16 @@ def check_live() -> Step:
                 + ("(仓位统一按最低档)" if mode == "guarded" else "(仓位按规则状态缩放)"))
 
 
-def evaluate() -> tuple[list[Step], str]:
+def evaluate(demo: bool = False) -> tuple[list[Step], str]:
+    """跑一遍六步判定。
+
+    `demo=True` 时把配置与状态指向 `examples/` 下的虚构固件 ——
+    **跑的是同一套判定代码**,只是数据是假的。这样演示 gif 既能展示真实流程,
+    又不会把任何真实账户信息录进公开仓(gif 是要提交的)。
+    """
+    if demo:
+        return _evaluate_demo()
+
     state = _load_state()
     steps = [
         check_uninitialized(),
@@ -389,6 +402,42 @@ def evaluate() -> tuple[list[Step], str]:
         check_strategy(),
         check_automation(state),
         check_live(),
+    ]
+    current = UNINITIALIZED
+    for s in steps:
+        if not s.ok:
+            break
+        current = s.state
+    return steps, current
+
+
+def _evaluate_demo() -> tuple[list[Step], str]:
+    """用 examples/ 固件跑真实判定 —— 停在"演练未做"这一步。
+
+    停在这里是刻意的:新用户最该看见的不是"全绿",而是
+    **"真钱执行还没开,因为演练还没跑"** —— 那才是这套顺序的意义。
+    """
+    ex = ROOT / "examples"
+    demo_cfg = {
+        "account": {"id": "000000000"},
+        "execution": {"enabled": False, "dry_run": True, "max_order_usd": 80,
+                      "max_daily_usd": 200, "max_orders_per_day": 6,
+                      "kill_switch_file": "data/HALTED", "live_mode": "guarded"},
+    }
+    fake_state = {"mcp_check": {"passed": True, "at": "2026-08-18 09:04 ET",
+                                "account_last4": "0000", "account_fp": "demo"}}
+
+    steps = [
+        check_uninitialized(),
+        Step(MCP_CONNECTED_READONLY, True,
+             f"已验证(账户 ***0000,{fake_state['mcp_check']['at']})"),
+        Step(PROFILE_READY, True, "账户 ***0000 · 单笔 $80 / 单日 $200 / 6 笔"
+             if not validate_execution(demo_cfg) else "配置不完整"),
+        check_strategy(rules_path=ex / "sample-rules.toml",
+                       vocab_path=ex / "sample-reason-tags.toml"),
+        check_automation({}),
+        Step(LIVE_AUTHORIZED, False, "真钱执行未开启(这是默认且安全的状态)",
+             ["确认前面全部通过后,用 setup.py --authorize-live 开启"]),
     ]
     current = UNINITIALIZED
     for s in steps:
@@ -742,6 +791,8 @@ def main(argv: list[str] | None = None) -> int:
     ap.add_argument("--approved", action="store_true",
                     help="声明用户已明确批准开启真钱执行")
     ap.add_argument("--checklist", action="store_true", help="打印验收项清单")
+    ap.add_argument("--demo", action="store_true",
+                    help="用 examples/ 的虚构固件跑同一套判定(演示/录制用,不读真实配置)")
     args = ap.parse_args(argv)
 
     if args.checklist:
@@ -786,7 +837,9 @@ def main(argv: list[str] | None = None) -> int:
         print(f"❌ 不是合法 JSON:{exc}", file=sys.stderr)
         return 2
 
-    steps, current = evaluate()
+    steps, current = evaluate(demo=args.demo)
+    if args.demo:
+        print("🧪 demo 模式:数据来自 examples/ 虚构固件,不读你的真实配置。\n")
     if args.json:
         print(json.dumps(
             {"current": current,

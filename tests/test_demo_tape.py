@@ -26,6 +26,8 @@ ALLOWED_COMMAND_PREFIXES = (
     "python3 scripts/preflight.py --order-file demo/",
     "python3 scripts/stats.py --file examples/",
     "python3 scripts/trading_day.py",
+    "python3 scripts/setup.py --demo",        # 固件驱动,不读真实 config/data
+    "python3 scripts/setup.py --checklist",   # 纯静态清单
     "clear",
     "export PS1=",
     "# ",                      # 纯注释行,只是给观众看的
@@ -104,6 +106,14 @@ class TestTapeUsesOnlyDemoData(unittest.TestCase):
             f"以下命令不在演示白名单里:{bad}\n"
             f"加进 ALLOWED_COMMAND_PREFIXES 前先确认它不会读真实数据。",
         )
+
+    def test_preflight_never_reads_the_real_profile(self):
+        """★ 2026-08-18 踩过:录制时 preflight 读了真实 config/profile.toml,
+        把账户号后 4 位录进了公开 gif。gif 是二进制,进仓后既难审计也难撤回。"""
+        for cmd in typed_commands():
+            if "preflight.py" in cmd:
+                self.assertIn("--profile demo/", cmd,
+                              f"录制里的 preflight 必须用演示配置:{cmd}")
 
     def test_dashboard_is_invoked_in_demo_mode(self):
         cmds = " ".join(typed_commands())

@@ -1,0 +1,38 @@
+# 演示专用配置 —— 全部为虚构占位值。
+#
+# 存在理由:录制 gif 时 preflight 必须**不读**真实的 config/profile.toml。
+# 2026-08-18 录制时曾因此把真实账户号的后 4 位录进了公开 gif ——
+# gif 是二进制,进了仓库既难审计也难撤回。
+# tests/test_demo_tape.py 强制录制脚本只能用这份配置。
+
+[account]
+id = "000000000"
+display_last4 = "0000"
+type = "cash"
+
+[execution]
+enabled = true
+dry_run = true      # 演示配置停在 dry_run:gif 里不该出现"可以真下单"的状态
+require_confirmation = false
+live_mode = "guarded"
+max_order_usd = 80
+max_daily_usd = 200
+max_orders_per_day = 6
+intent_ttl_minutes = 15
+quote_max_age_minutes = 10
+kill_switch_file = "demo/__no_such_halt__"
+size_scale_observe = 0.4
+size_scale_weak = 0.7
+size_scale_supported = 1.0
+
+[trade]
+size_std = 50
+size_max = 80
+
+[position]
+max_single_pct = 50
+reduce_pct_warn = 50
+residual_threshold_ratio = 0.5
+
+[cash]
+floor_pct = 15
