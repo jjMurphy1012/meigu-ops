@@ -18,6 +18,7 @@ import rules as R  # noqa: E402
 from meigu_lib import TRADE_COLUMNS, ConfigError, Vocabulary, parse_trades  # noqa: E402
 from rules import (  # noqa: E402
     DEFAULT_MIN_SAMPLES,
+    REGIME_SHIFT,
     DEFAULT_WEAK_MIN_SAMPLES,
     ENFORCED,
     INCONCLUSIVE,
@@ -31,6 +32,9 @@ from rules import (  # noqa: E402
     audit_rules,
     load_rules,
 )
+import json  # noqa: E402
+import rules as R  # noqa: E402
+from rules import Verdict  # noqa: E402
 from stats import summarize  # noqa: E402
 
 ROOT = Path(__file__).resolve().parent.parent
@@ -253,6 +257,161 @@ class TestAuditTagCompare(unittest.TestCase):
         r = self._rule(["甲"], ["乙"])
         r.status = "hypothesis"
         self.assertIn("supported", audit_rule(r, s).suggestion)
+
+
+class TestAuditSeparatesSignalFromNoise(unittest.TestCase):
+    """★ 样本量回答"够不够多",信噪比回答"差异是不是真的" —— 两个问题。
+
+    只比均值时,"$40 vs $38(波动 ±$30)" 和 "$40 vs $5(波动 ±$1)"
+    会得到同一个结论。前者几乎肯定只是抖动。
+    """
+
+    def _rule(self):
+        return Rule("r", "命题", kind="market",
+                    test={"type": "tag_compare", "better": ["甲"], "worse": ["乙"]})
+
+    def _ledger(self, better_pnls, worse_pnls):
+        rows, day = [], 1
+        for pnls, tag, prefix in ((better_pnls, "甲", "B"), (worse_pnls, "乙", "W")):
+            for pnl in pnls:
+                d = _day(day)
+                rows.append(row(d[0], f"{prefix}{day}", "buy", 1, 100.0, 100.0, "建仓"))
+                rows.append(row(d[1], f"{prefix}{day}", "sell", 1,
+                                100.0 + pnl, 100.0 + pnl, tag))
+                day += 1
+        return summary_of(*rows)
+
+    def test_large_sample_but_noisy_difference_is_inconclusive(self):
+        """样本够了、方向也一致,但差异淹在波动里 —— 不许下结论。"""
+        better = [40 + (30 if i % 2 else -30) for i in range(20)]   # 均值 40,波动 ±30
+        worse = [38 + (30 if i % 2 else -30) for i in range(20)]    # 均值 38,同样波动
+        v = audit_rule(self._rule(), self._ledger(better, worse))
+        self.assertEqual(v.result, INCONCLUSIVE)
+        self.assertIn("噪音", v.detail)
+
+    def test_same_gap_with_low_noise_is_conclusive(self):
+        """同样是 $2 的差,波动小的时候就是真的。"""
+        v = audit_rule(self._rule(), self._ledger([40] * 20, [38] * 20))
+        self.assertEqual(v.result, SUPPORTS)
+
+    def test_confidence_requires_both_sample_and_signal(self):
+        v = audit_rule(self._rule(), self._ledger([10] * 40, [-5] * 40))
+        self.assertEqual(v.result, SUPPORTS)
+        self.assertIn(v.confidence, (MODERATE, "strong"))
+
+
+class TestAuditDistinguishesRegimeChange(unittest.TestCase):
+    """★ 第三种可能:规则没错,是环境变了。
+
+    只有 supports / refutes 两个出口时,一次风格切换会被读成"这条规则是错的" ——
+    然后你在市场刚要回到它擅长的环境时,把它退役了。
+    """
+
+    def _rule(self):
+        return Rule("r", "命题", kind="market",
+                    test={"type": "tag_compare", "better": ["甲"], "worse": ["乙"]})
+
+    def _ledger(self, pairs):
+        """pairs: [(甲的盈亏, 乙的盈亏), ...] 按时间顺序。"""
+        rows, day = [], 1
+        for b, w in pairs:
+            d = _day(day)
+            rows.append(row(d[0], f"B{day}", "buy", 1, 100.0, 100.0, "建仓"))
+            rows.append(row(d[1], f"B{day}", "sell", 1, 100.0 + b, 100.0 + b, "甲"))
+            day += 1
+            d = _day(day)
+            rows.append(row(d[0], f"W{day}", "buy", 1, 100.0, 100.0, "建仓"))
+            rows.append(row(d[1], f"W{day}", "sell", 1, 100.0 + w, 100.0 + w, "乙"))
+            day += 1
+        return summary_of(*rows)
+
+    def test_direction_reversal_is_flagged_as_regime_shift(self):
+        """前半段规则成立、后半段反过来 —— 这不是"规则错了"。"""
+        early = [(12, -6)] * 10      # 前半段:甲明显更好
+        late = [(-6, 12)] * 10       # 后半段:完全反过来
+        v = audit_rule(self._rule(), self._ledger(early + late))
+        self.assertEqual(v.result, REGIME_SHIFT)
+        self.assertIn("先别改状态", v.suggestion)
+        self.assertIn("环境", v.suggestion)
+
+    def test_consistent_failure_is_still_refuted(self):
+        """前后两段都不支持 —— 那就是规则的问题,不能拿"环境变了"当挡箭牌。"""
+        v = audit_rule(self._rule(), self._ledger([(-6, 12)] * 20))
+        self.assertEqual(v.result, REFUTES)
+        self.assertIn("前后两段结论一致", v.suggestion)
+
+    def test_tag_composition_change_is_not_mistaken_for_regime_shift(self):
+        """前半段几乎全是标签甲、后半段全是标签乙,差异来自构成而非环境。
+
+        所以时间切分必须**按标签各自切半**,不能把整组混在一起切。
+        """
+        rows, day = [], 1
+        seq = [(5, "甲")] * 20 + [(-9, "乙")] * 20 + [(9, "丙")] * 20
+        for pnl, tag in seq:
+            d = _day(day)
+            rows.append(row(d[0], f"S{day}", "buy", 1, 100.0, 100.0, "建仓"))
+            rows.append(row(d[1], f"S{day}", "sell", 1, 100.0 + pnl, 100.0 + pnl, tag))
+            day += 1
+        r = Rule("r", "命题", kind="market",
+                 test={"type": "tag_compare", "better": ["甲"], "worse": ["乙", "丙"]})
+        self.assertNotEqual(audit_rule(r, summary_of(*rows)).result, REGIME_SHIFT)
+
+
+class TestAuditHistoryStability(unittest.TestCase):
+    """★ 单次判定回答不了"今天判坏,下周会不会又变好"。
+
+    一个来回翻转的判定,本身就说明它不该被用来改状态。
+    """
+
+    def setUp(self):
+        import tempfile as _tf
+
+        self._saved = R.AUDIT_LOG
+        R.AUDIT_LOG = Path(_tf.mkdtemp()) / "audit-log.jsonl"
+
+    def tearDown(self):
+        R.AUDIT_LOG = self._saved
+
+    def _log(self, *results):
+        R.AUDIT_LOG.parent.mkdir(parents=True, exist_ok=True)
+        with R.AUDIT_LOG.open("w", encoding="utf-8") as fh:
+            for r in results:
+                fh.write(json.dumps({"at": "2026-08-18", "rule": "r1",
+                                     "result": r, "confidence": "moderate",
+                                     "samples": 25}) + "\n")
+
+    def test_no_history_is_not_stable(self):
+        """第一次看到某个结论,不该立刻据此改变一条规则能否指导真钱下单。"""
+        ok, note = R.history_is_stable("r1", SUPPORTS)
+        self.assertFalse(ok)
+        self.assertIn("只有 0 次", note)
+
+    def test_two_consistent_audits_are_stable(self):
+        self._log(SUPPORTS, SUPPORTS)
+        ok, note = R.history_is_stable("r1", SUPPORTS)
+        self.assertTrue(ok, note)
+
+    def test_flipping_verdicts_are_not_stable(self):
+        self._log(SUPPORTS, REFUTES)
+        ok, note = R.history_is_stable("r1", REFUTES)
+        self.assertFalse(ok)
+        self.assertIn("翻转", note)
+
+    def test_only_the_latest_audits_count(self):
+        """半年前支持过,不代表现在还支持。"""
+        self._log(SUPPORTS, SUPPORTS, SUPPORTS, REFUTES, REFUTES)
+        self.assertTrue(R.history_is_stable("r1", REFUTES)[0])
+        self.assertFalse(R.history_is_stable("r1", SUPPORTS)[0])
+
+    def test_stability_note_surfaces_before_status_change(self):
+        self._log(SUPPORTS, REFUTES)
+        self.assertIn("翻转", R.stability_note("r1", "refuted"))
+
+    def test_record_audit_appends(self):
+        v = Verdict(Rule("r1", "x", kind="market"), SUPPORTS, MODERATE, "d", "s", 25)
+        R.record_audit([v])
+        R.record_audit([v])
+        self.assertEqual(len(R.audit_history("r1")), 2)
 
 
 class TestNoBuiltInStrategy(unittest.TestCase):

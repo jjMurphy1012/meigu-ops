@@ -20,7 +20,7 @@ from collections import defaultdict, deque
 from dataclasses import dataclass
 
 from meigu_lib import LedgerError, Trade, load_vocabulary, parse_trades
-from rules import audit_rules, load_rules
+from rules import audit_history, audit_rules, load_rules, record_audit
 
 # 笔数低于这个数时,胜率与平均值是噪音,不做百分比解读。
 MIN_SAMPLE = 20
@@ -123,8 +123,10 @@ def summarize(trades: list[Trade], vocab=None) -> dict:
         # ★ 样本单位是**决策事件**(一笔卖出 = 一次退出决策),不是 FIFO lot 数量:
         # 一笔卖单可能匹配三个历史买入批次,那仍然只是一个决策。
         per_event: dict[int, float] = {}
+        per_event_date: dict[int, str] = {}
         for m in ms:
             per_event[m.sell_line_no] = per_event.get(m.sell_line_no, 0.0) + m.pnl
+            per_event_date.setdefault(m.sell_line_no, str(getattr(m, "sell_date", "")))
         vals = list(per_event.values())
         by_tag[tag] = {
             "side": "sell",
@@ -135,6 +137,10 @@ def summarize(trades: list[Trade], vocab=None) -> dict:
             "pnl": sum(vals) if vals else 0.0,
             "win_rate": (len([v for v in vals if v > 0]) / len(vals) * 100) if vals else None,
             "avg_pnl": (sum(vals) / len(vals)) if vals else None,
+            # 逐事件明细 —— 审计需要它来算离散度、并把历史切成前后两段。
+            # 只有均值的话,"差异是真的"和"差异在噪音里"长得一模一样。
+            "values": vals,
+            "dates": [per_event_date.get(k, "") for k in per_event],
         }
 
     # --- 按检查点
@@ -205,7 +211,7 @@ RULES_PATH_OVERRIDE = None
 VOCAB_OVERRIDE = None
 
 
-def print_report(s: dict) -> None:
+def print_report(s: dict, demo_mode: bool = False) -> None:
     print("=== meigu-ops 台账统计 ===")
     if not s["trade_count"]:
         print("\ndata/trades.tsv 里还没有交易记录。")
@@ -266,9 +272,20 @@ def print_report(s: dict) -> None:
             print("      尚未定义任何市场判断类规则。")
             print("      cp config/rules.example.toml config/rules.toml 并回答里面的问题 ——")
             print("      定义了可检验的规则,这里才能告诉你它们是否被数据支持。")
-        for v in audit_rules(market, s):
+        verdicts = audit_rules(market, s)
+        if not demo_mode:
+            # 记录本次判定,供下次审计比对稳定性。
+            # 一个会来回翻转的判定,本身就说明它不该被用来改状态。
+            record_audit(verdicts)
+        for v in verdicts:
             scope = "" if v.rule.may_authorize_live else "  [观察期,不可单独授权下单]"
             print(f"      {v.icon} [{v.label}] {v.rule.statement}{scope}")
+            hist = audit_history(v.rule.id, limit=4)
+            if len(hist) >= 2:
+                from rules import RESULT_ZH as _ZH
+
+                seq = " → ".join(_ZH.get(h.get("result"), "?") for h in hist)
+                print(f"         历次判定:{seq}")
             if v.detail:
                 print(f"          {v.detail}")
             if v.suggestion:
@@ -377,7 +394,7 @@ def main(argv: list[str] | None = None) -> int:
     global RULES_PATH_OVERRIDE, VOCAB_OVERRIDE
     RULES_PATH_OVERRIDE = rules_path
     VOCAB_OVERRIDE = vocab
-    print_report(s)
+    print_report(s, demo_mode=args.demo)
     return 0
 
 

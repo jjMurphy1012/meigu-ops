@@ -49,6 +49,7 @@ refuted/retired → none。**零样本的新假设不应该拿真钱去试。**
 from __future__ import annotations
 
 import argparse
+import json
 import sys
 import tomllib
 from dataclasses import dataclass, field
@@ -56,6 +57,7 @@ from pathlib import Path
 
 from meigu_lib import (
     CONFIG_DIR,
+    DATA_DIR,
     ROOT,
     ConfigError,
     load_vocabulary,
@@ -66,6 +68,10 @@ from meigu_lib import (
 
 # ---- 结论方向
 SUPPORTS = "supports"
+# ★ 第三种可能:规则没错,是环境变了。
+# 只有 supports / refutes 两个出口时,一次风格切换会被读成"这条规则是错的",
+# 于是你在市场刚要回到它擅长的环境时把它退役了。
+REGIME_SHIFT = "regime_shift"
 REFUTES = "refutes"
 INCONCLUSIVE = "inconclusive"
 # ---- 非数据类判定
@@ -107,7 +113,7 @@ SCOPE_BY_STATUS = {
 }
 
 RESULT_ZH = {SUPPORTS: "支持", REFUTES: "不支持", INCONCLUSIVE: "数据不足",
-             ENFORCED: "程序强制", MANUAL: "需人工核查"}
+             REGIME_SHIFT: "环境可能变了", ENFORCED: "程序强制", MANUAL: "需人工核查"}
 CONFIDENCE_ZH = {INSUFFICIENT: "样本不足", WEAK: "弱", MODERATE: "中", STRONG: "强"}
 
 
@@ -187,7 +193,7 @@ class Verdict:
 
     @property
     def label(self) -> str:
-        if self.result in (ENFORCED, MANUAL, INCONCLUSIVE):
+        if self.result in (ENFORCED, MANUAL, INCONCLUSIVE, REGIME_SHIFT):
             return RESULT_ZH[self.result]
         prefix = "弱" if self.confidence == WEAK else ""
         return prefix + ("支持" if self.result == SUPPORTS else "反驳")
@@ -200,10 +206,77 @@ class Verdict:
             return "👁"
         if self.result == INCONCLUSIVE:
             return "…"
+        if self.result == REGIME_SHIFT:
+            return "🔀"
         strong = self.confidence in (MODERATE, STRONG)
         if self.result == SUPPORTS:
             return "✅" if strong else "🟢"
         return "❌" if strong else "🟠"
+
+
+# --------------------------------------------------------------- 审计历史(稳定性)
+AUDIT_LOG = DATA_DIR / "audit-log.jsonl"
+
+
+def record_audit(verdicts: list["Verdict"]) -> None:
+    """把本次审计的判定追加进历史。
+
+    ★ 为什么要留历史:单次判定回答不了"这条规则今天是坏的,下周会不会又变好"。
+    **一个会来回翻转的判定,本身就说明它不该被用来改状态。**
+    有了历史,"连续两次同向"才算稳定 —— 这是最便宜也最有效的防翻转手段。
+
+    属于用户层(data/ 已 gitignore)。写失败不影响审计本身。
+    """
+    import datetime as _dt
+
+    try:
+        DATA_DIR.mkdir(parents=True, exist_ok=True)
+        stamp = _dt.date.today().isoformat()
+        with AUDIT_LOG.open("a", encoding="utf-8") as fh:
+            for v in verdicts:
+                fh.write(json.dumps({
+                    "at": stamp, "rule": v.rule.id, "result": v.result,
+                    "confidence": v.confidence, "samples": v.samples,
+                }, ensure_ascii=False) + "\n")
+    except OSError:
+        pass
+
+
+def audit_history(rule_id: str, limit: int = 5) -> list[dict]:
+    """某条规则最近几次的审计判定(旧 → 新)。"""
+    if not AUDIT_LOG.exists():
+        return []
+    out = []
+    try:
+        for line in AUDIT_LOG.read_text(encoding="utf-8").splitlines():
+            if not line.strip():
+                continue
+            try:
+                rec = json.loads(line)
+            except json.JSONDecodeError:
+                continue
+            if rec.get("rule") == rule_id:
+                out.append(rec)
+    except OSError:
+        return []
+    return out[-limit:]
+
+
+def history_is_stable(rule_id: str, result: str, need: int = 2) -> tuple[bool, str]:
+    """最近 `need` 次审计是否都指向同一个结论。
+
+    返回 (是否稳定, 给人看的一句话)。没有历史时视为不稳定 ——
+    **第一次看到某个结论,不该立刻据此改变一条规则能否指导真钱下单。**
+    """
+    hist = [h for h in audit_history(rule_id, limit=need * 3)
+            if h.get("result") in (SUPPORTS, REFUTES, REGIME_SHIFT)]
+    recent = hist[-need:]
+    seq = " → ".join(RESULT_ZH.get(h["result"], h["result"]) for h in recent) or "(无历史)"
+    if len(recent) < need:
+        return False, f"审计历史只有 {len(recent)} 次(需 {need} 次同向):{seq}"
+    if all(h["result"] == result for h in recent):
+        return True, f"最近 {need} 次审计一致:{seq}"
+    return False, f"最近 {need} 次审计在翻转:{seq} —— 翻转期不要改状态"
 
 
 # ------------------------------------------------------------------ 加载与校验
@@ -346,6 +419,69 @@ def load_rules(required: bool = False, path: Path | None = None,
 
 
 # ------------------------------------------------------------------------ 审计
+def _tag_events(summary: dict, tag: str) -> list[tuple[str, float]]:
+    """某个标签下的逐事件 (日期, 盈亏)。没有明细时回退到均值 × 事件数。"""
+    d = (summary.get("by_tag") or {}).get(tag)
+    if not d:
+        return []
+    vals = d.get("values")
+    if vals:
+        dates = d.get("dates") or [""] * len(vals)
+        return list(zip(dates, [float(v) for v in vals]))
+    avg, n = d.get("avg_pnl"), int(d.get("events", 0) or 0)
+    return [("", float(avg))] * n if avg is not None and n else []
+
+
+def _mean(xs: list[float]) -> float:
+    return sum(xs) / len(xs) if xs else 0.0
+
+
+def _var(xs: list[float]) -> float:
+    """样本方差(n-1)。少于 2 个样本时没有离散度可谈,返回 0。"""
+    if len(xs) < 2:
+        return 0.0
+    m = _mean(xs)
+    return sum((x - m) ** 2 for x in xs) / (len(xs) - 1)
+
+
+def _signal_to_noise(b: list[float], w: list[float]) -> float:
+    """两组均值之差相对于噪音的倍数(近似 t 统计量)。
+
+    ★ 为什么必须算这个:只比均值时,"$40 vs $38" 和 "$40 vs $5" 得到同一个结论
+    ——"better 组更好"。但前者很可能只是抖动。
+    **样本量回答"够不够多",信噪比回答"差异是不是真的"** —— 两个问题,缺一不可。
+
+    分母为 0(两组内部都毫无波动)时返回一个大数:那种情况下差异是确定的。
+    """
+    if not b or not w:
+        return 0.0
+    se = (_var(b) / max(len(b), 1) + _var(w) / max(len(w), 1)) ** 0.5
+    diff = _mean(b) - _mean(w)
+    if se == 0:
+        return 0.0 if diff == 0 else float("inf")
+    return abs(diff) / se
+
+
+def _split_by_time(per_tag: list[list[tuple[str, float]]]) -> tuple[list[float], list[float]]:
+    """把一组标签的事件切成前半段 / 后半段。
+
+    ★ 关键在于**每个标签各自切半再合并**,而不是把整组混在一起按日期切。
+    混着切会把"标签构成变了"误判成"市场环境变了" —— 比如前半段几乎都是标签甲、
+    后半段几乎都是标签乙,那两段的差异来自标签本身,与环境无关。
+    各自切半能保证前后两段的标签构成一致,剩下的差异才更可能真的来自环境。
+    """
+    early: list[float] = []
+    late: list[float] = []
+    for events in per_tag:
+        if len(events) < 2:
+            continue
+        ordered = sorted(events, key=lambda e: e[0])
+        mid = len(ordered) // 2
+        early += [v for _, v in ordered[:mid]]
+        late += [v for _, v in ordered[mid:]]
+    return early, late
+
+
 def _tag_stats(summary: dict, tag: str) -> tuple[float | None, int]:
     """(均笔实现盈亏, 独立决策事件数)。
 
@@ -377,51 +513,84 @@ def audit_rule(rule: Rule, summary: dict) -> Verdict:
     better = [str(t) for t in rule.test.get("better", [])]
     worse = [str(t) for t in rule.test.get("worse", [])]
 
-    b = [(t, *_tag_stats(summary, t)) for t in better]
-    w = [(t, *_tag_stats(summary, t)) for t in worse]
-    b_ok = [(t, v, n) for t, v, n in b if v is not None]
-    w_ok = [(t, v, n) for t, v, n in w if v is not None]
+    b_per_tag = [_tag_events(summary, tag) for tag in better]
+    w_per_tag = [_tag_events(summary, tag) for tag in worse]
+    b_events = [e for evs in b_per_tag for e in evs]
+    w_events = [e for evs in w_per_tag for e in evs]
 
-    if not b_ok or not w_ok:
-        missing = [t for t, v, _ in b + w if v is None]
+    if not b_events or not w_events:
+        missing = [tag for tag in better + worse if not _tag_events(summary, tag)]
         return Verdict(rule, INCONCLUSIVE, INSUFFICIENT,
                        f"缺少归集数据的标签:{'/'.join(missing) or '(全部)'}",
                        "继续记录,或检查这些标签是否真的在用")
 
-    def wavg(rows):
-        """按决策事件数加权 —— 3 个事件的标签不应与 100 个事件的等权。"""
-        total = sum(n for _, _, n in rows)
-        if not total:
-            return sum(v for _, v, _ in rows) / len(rows)
-        return sum(v * n for _, v, n in rows) / total
+    b_vals = [v for _, v in b_events]
+    w_vals = [v for _, v in w_events]
+    b_avg, w_avg = _mean(b_vals), _mean(w_vals)
+    n = min(len(b_vals), len(w_vals))
+    diff = b_avg - w_avg
+    snr = _signal_to_noise(b_vals, w_vals)
 
-    b_avg, w_avg = wavg(b_ok), wavg(w_ok)
-    n = min(sum(n for _, _, n in b_ok), sum(n for _, _, n in w_ok))
+    detail = (f"{'/'.join(better)} 均 {'+' if b_avg >= 0 else '-'}${abs(b_avg):.2f}"
+              f"({len(b_vals)} 事件)  vs  "
+              f"{'/'.join(worse)} 均 {'+' if w_avg >= 0 else '-'}${abs(w_avg):.2f}"
+              f"({len(w_vals)} 事件)")
 
-    def fmt(rows):
-        return " / ".join(
-            f"{t} {'+' if v >= 0 else '-'}${abs(v):.2f}({c} 事件)" for t, v, c in rows
-        )
-
-    detail = f"{fmt(b_ok)}  vs  {fmt(w_ok)}"
-    result = SUPPORTS if b_avg > w_avg else REFUTES
-
+    # ① 样本量:够不够多
     if n < weak_n:
         return Verdict(rule, INCONCLUSIVE, INSUFFICIENT,
                        f"{detail} —— 较小一侧仅 {n} 个事件(< {weak_n},方向不可信)",
                        f"攒够 {weak_n} 个决策事件才谈趋势,{min_n} 个才谈改状态", n)
-    if n < min_n:
-        return Verdict(rule, result, WEAK, f"{detail} —— 较小一侧 {n} 个事件",
-                       f"只是趋势提示,不足以改状态(需 ≥{min_n} 个决策事件)", n)
 
-    conf = STRONG if n >= min_n * 2 else MODERATE
+    # ② 前后两段是否一致:规则错了,还是环境变了
+    #
+    # ★ 这一步必须排在信噪比之前。一次**完整的反转**(前半段 +12、后半段 -12)
+    # 在全期均值里恰好互相抵消 —— 于是信噪比接近 0,判成"数据不足",
+    # 而你永远看不到那个最重要的事实:这条规则的有效性掉过头。
+    b_early, b_late = _split_by_time(b_per_tag)
+    w_early, w_late = _split_by_time(w_per_tag)
+    halves_usable = min(len(b_early), len(b_late), len(w_early), len(w_late)) >= max(3, weak_n // 2)
+    if halves_usable:
+        d_early = _mean(b_early) - _mean(w_early)
+        d_late = _mean(b_late) - _mean(w_late)
+        # 两段方向相反,且**各自都不是噪音** —— 随机翻个号不算环境变化
+        if (d_early * d_late < 0
+                and _signal_to_noise(b_early, w_early) >= 1.0
+                and _signal_to_noise(b_late, w_late) >= 1.0):
+            newer = "近期反转为不支持" if d_late < 0 else "近期反转为支持"
+            return Verdict(
+                rule, REGIME_SHIFT, WEAK,
+                f"{detail} —— 前半段差 ${d_early:+.2f},后半段差 ${d_late:+.2f}({newer})",
+                "**先别改状态。** 前后两段结论相反,更像是市场环境变了而不是规则错了 —— "
+                "给这条规则补一个适用环境的条件(比如「仅在下跌趋势中」),然后分环境重新计数;"
+                "确实要停用就降为 provisional 观察,不要直接 refuted。",
+                n)
+
+    # ③ 信噪比:差异是不是真的
+    # 样本够了但差异淹在波动里 —— 这时候下结论,判的是运气不是规则。
+    if snr < 1.0:
+        return Verdict(
+            rule, INCONCLUSIVE, INSUFFICIENT,
+            f"{detail} —— 差值 ${abs(diff):.2f} 在噪音范围内(信噪比 {snr:.1f} < 1.0)",
+            "样本够了,但两组差异小于组内波动 —— 继续记录,不要凭方向改状态", n)
+
+    result = SUPPORTS if diff > 0 else REFUTES
+
+    if n < min_n or snr < 2.0:
+        why = f"较小一侧 {n} 个事件" if n < min_n else f"信噪比 {snr:.1f}(< 2.0)"
+        return Verdict(rule, result, WEAK, f"{detail} —— {why}",
+                       f"只是趋势提示,不足以改状态(需 ≥{min_n} 个决策事件且信噪比 ≥ 2.0)", n)
+
+    conf = STRONG if n >= min_n * 2 and snr >= 3.0 else MODERATE
     if result == SUPPORTS:
         sug = ("证据足够,可**建议**升为 supported —— 仍需你本人批准"
                if rule.status == "hypothesis" else "")
     else:
-        sug = ("数据与规则相反。修正判定标准,或降为 refuted(**保留记录,不要删**)—— "
+        sug = ("数据与规则相反,且前后两段结论一致(不是环境变化)。"
+               "修正判定标准,或降为 refuted(**保留记录,不要删**)—— "
                "从未被数据支持过的规则是包袱,不是资产")
-    return Verdict(rule, result, conf, f"{detail} —— 较小一侧 {n} 个事件", sug, n)
+    return Verdict(rule, result, conf,
+                   f"{detail} —— 较小一侧 {n} 个事件,信噪比 {snr:.1f}", sug, n)
 
 
 def audit_rules(rules: list[Rule], summary: dict,
@@ -552,6 +721,15 @@ def record_evidence(rule_id: str, text: str, path: Path | None = None) -> str:
     return f"已为 {rule_id} 追加一条证据"
 
 
+def stability_note(rule_id: str, status: str) -> str:
+    """改状态前给出的稳定性提示(不阻断,但必须让人看见)。"""
+    target = {"supported": SUPPORTS, "refuted": REFUTES, "retired": REFUTES}.get(status)
+    if target is None:
+        return ""
+    ok, note = history_is_stable(rule_id, target)
+    return ("✅ " if ok else "⚠️  ") + note
+
+
 def set_status(rule_id: str, status: str, note: str = "",
                path: Path | None = None) -> str:
     """改规则状态。**改变的是它能否指导真钱下单**,所以必须用户批准。"""
@@ -676,14 +854,19 @@ def main(argv: list[str] | None = None) -> int:
                                   origin=args.origin, approved=args.approved))
             return 0
         if args.set_status:
+            rid, new_status = args.set_status
+            note = stability_note(rid, new_status)
             if not args.approved:
                 print("❌ 改状态会改变这条规则能否指导真钱下单 —— 需要用户明确批准。",
                       file=sys.stderr)
+                if note:
+                    print(f"   {note}", file=sys.stderr)
                 print("   先向用户说明依据与建议,得到确认后再加 --approved 重跑。",
                       file=sys.stderr)
                 return 1
-            print("✅ " + set_status(args.set_status[0], args.set_status[1],
-                                     note=args.note, path=target))
+            if note:
+                print(note)          # 已批准也要把稳定性摆出来,留在会话记录里
+            print("✅ " + set_status(rid, new_status, note=args.note, path=target))
             return 0
     except ConfigError as exc:
         print(f"❌ {exc}", file=sys.stderr)
