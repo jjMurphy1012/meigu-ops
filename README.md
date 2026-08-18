@@ -12,7 +12,7 @@
 <p align="center">
   <img src="https://img.shields.io/badge/Python-3.11+-3776AB?style=flat&logo=python&logoColor=white" alt="Python 3.11+">
   <img src="https://img.shields.io/badge/dependencies-none-2ea44f?style=flat" alt="Zero dependencies">
-  <img src="https://img.shields.io/badge/tests-274%20passing-2ea44f?style=flat" alt="274 tests">
+  <img src="https://img.shields.io/badge/tests-295%20passing-2ea44f?style=flat" alt="295 tests">
   <a href="https://claude.com/claude-code"><img src="https://img.shields.io/badge/Built_with-Claude_Code-000?style=flat&logo=anthropic&logoColor=white" alt="Built with Claude Code"></a>
   <img src="https://img.shields.io/badge/License-MIT-blue.svg" alt="MIT">
   <a href="DISCLAIMER.md"><img src="https://img.shields.io/badge/%E2%9A%A0%EF%B8%8F-%E4%B8%8D%E6%9E%84%E6%88%90%E6%8A%95%E8%B5%84%E5%BB%BA%E8%AE%AE-critical" alt="Not investment advice"></a>
@@ -107,22 +107,35 @@
 ```bash
 git clone https://github.com/jjMurphy1012/meigu-ops.git
 cd meigu-ops
-
-cp config/profile.example.toml      config/profile.toml       # 账户与尺寸参数
-cp config/watchlist.example.toml    config/watchlist.toml     # 关注池与日报骨架
-cp config/reason-tags.example.toml  config/reason-tags.toml   # 你的理由标签词表
-cp modes/_strategy.example.md       modes/_strategy.md        # 你的策略(回答里面的问题)
-cp config/rules.example.toml        config/rules.toml         # 可检验的规则条目
-
-make doctor        # 环境自检
-make rules-check   # 规则格式 / 标签引用 / 闸门引用
-make test          # 274 个测试
-make report        # 生成当日日报骨架
+make setup        # ★ 从这里开始
 ```
 
-**第四步是这个项目的重点,也是最花时间的一步。** `modes/_strategy.example.md` 里
-全是问题,没有答案 —— 那些答案必须由你自己写。起步建议:**先只写 2–3 条你最相信的规则**。
-十条没被检验过的规则,不如两条被数据支持过的。
+`make setup` 是一个**状态机**,它会告诉你当前处于哪一步、下一步该做什么:
+
+```
+1. UNINITIALIZED          环境与仓库完整性
+2. MCP_CONNECTED_READONLY 券商只读验证 —— 连得上、连对账户、能拿到时间戳
+3. PROFILE_READY          账户号与四条硬上限
+4. STRATEGY_READY         你自己的标签词表与规则  ← 最花时间的一步
+5. AUTOMATION_READY       dry-run 端到端演练
+6. LIVE_AUTHORIZED        单独授权真钱执行
+```
+
+**顺序是刻意的:连接要早、只读;授权要晚、单独。**
+
+把连券商放在最后,你会配置半天才发现账户或权限根本不可用 —— 那时 MCP 的问题
+和项目配置的问题已经混在一起。但**连接成功不等于获得下单权限**:第 2 步全程
+只读,连 `place_equity_order` 都不会被调用。
+
+第 4 步是这个项目的重点。`modes/_strategy.example.md` 里全是问题、没有答案 ——
+那些答案必须由你自己写。起步建议:**先只写 2–3 条你最相信的规则**。
+
+**只想看看效果、不连券商?**
+
+```bash
+make dashboard-demo                 # 全套工作流,虚构固件,不需要任何账户
+python3 scripts/stats.py --demo
+```
 
 完整配置见 [docs/SETUP.md](docs/SETUP.md)。
 
@@ -138,6 +151,7 @@ make report        # 生成当日日报骨架
 | `make dashboard` | 只读仪表盘 TUI | 每天要看的三张表,一屏看完 |
 | `make trading-day` | 交易日 / 半日市 / 上下一交易日 | 观察日顺延、耶稣受难日人算会错,错一次毁一天 |
 | `make journal-check` | 日志结构:标题 / 倒序 / 孤儿段落 / 行数 | `Edit` 返回成功 ≠ 文档结构对了 |
+| `make setup` | 接入状态机:当前哪一步、下一步做什么 | 连券商与授权真钱必须分开,顺序错了会把两类问题混在一起 |
 | `make check-privacy` | 提交前隐私检查 | 人会忘,而这个错误不可逆 |
 
 ## 关于"全自动"的边界

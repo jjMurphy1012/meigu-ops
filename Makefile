@@ -3,13 +3,20 @@ S  := scripts
 
 .DEFAULT_GOAL := help
 
-.PHONY: help doctor trading-day calendar report journal-check journal-compress stats \
+.PHONY: help setup setup-checklist doctor trading-day calendar report journal-check \
+        journal-compress stats \
         preflight preflight-example rules-check dashboard dashboard-demo demo snapshot \
         check-privacy test lint clean
 
 help: ## 显示所有可用命令
 	@grep -E '^[a-zA-Z_-]+:.*?## .*$$' $(MAKEFILE_LIST) \
 		| awk 'BEGIN {FS = ":.*?## "}; {printf "  \033[36m%-18s\033[0m %s\n", $$1, $$2}'
+
+setup: ## ★ 首次接入:看当前处于哪一步、下一步做什么
+	@$(PY) $(S)/setup.py
+
+setup-checklist: ## 接入各步的验收项清单
+	@$(PY) $(S)/setup.py --checklist
 
 doctor: ## 环境自检(盘前第一件事)
 	@$(PY) $(S)/doctor.py

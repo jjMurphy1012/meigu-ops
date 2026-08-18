@@ -8,7 +8,7 @@ description: >-
 arguments: mode
 user_invocable: true
 user-invocable: true
-argument-hint: "[premarket | check | trade | daily | journal | review | stats | doctor]"
+argument-hint: "[setup | premarket | check | trade | daily | journal | review | stats | doctor]"
 license: MIT
 ---
 
@@ -19,6 +19,8 @@ license: MIT
 
 ## 执行前置(每个 mode 都要做)
 
+0. **首次使用先跑 `make setup`** —— 它会告诉你处于接入的哪一步。
+   若用户还没完成券商只读验证或策略配置,先走 `modes/setup.md`,不要直接开始交易。
 1. 读 `AGENTS.md`(铁律 / 数据分层 / 不可信内容 / 输出约定)。
 2. 读 `modes/_mechanics.md`(平台机制与执行陷阱 —— **不含任何策略**)。
 3. 读**用户自己的策略层**:
@@ -56,6 +58,7 @@ license: MIT
 | 输入 | Mode | 文件 | 用途 |
 |---|---|---|---|
 | (空) | `discovery` | — | 显示菜单 |
+| `setup` / `接入` / 首次使用 | `setup` | `modes/setup.md` | 首次接入状态机:先只读连券商,最后才授权真钱 |
 | `premarket` / `盘前` | `premarket` | `modes/premarket.md` | 盘前分析,定今日方案与候选 |
 | `check` / `盘中` | `check` | `modes/check.md` | 盘中检查点:买/卖/不动决策 |
 | `trade` / `下单` | `trade` | `modes/trade.md` | 执行下单 + 事后汇报 + 记台账 |
@@ -79,6 +82,7 @@ license: MIT
 ```
 meigu-ops v5 · 美股决策指挥中心
 
+  /meigu-ops setup       ★ 首次接入 —— 先只读连券商,最后才单独授权真钱
   /meigu-ops premarket   盘前分析 —— 定今日方案、候选与触发位
   /meigu-ops check       盘中检查点 —— 买 / 卖 / 不动的决策
   /meigu-ops trade       执行下单 —— review → place → 汇报 → 记台账

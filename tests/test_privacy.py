@@ -1,5 +1,6 @@
 """隐私检查测试 —— 这是数据分层契约的最后一道防线,必须真的能拦住东西。"""
 
+import re
 import sys
 import unittest
 from pathlib import Path
@@ -154,6 +155,54 @@ class TestRepositoryIsClean(unittest.TestCase):
         """整个仓库当前状态必须通过隐私检查 —— 这条失败就说明真的漏了东西。"""
         problems = check_privacy.check(check_privacy.all_files())
         self.assertEqual(problems, [], "\n".join(problems))
+
+
+class TestScannersAgree(unittest.TestCase):
+    """本地扫描器与 CI 历史扫描器不得对同一行给出相反结论。
+
+    2026-08-18 踩过:本地 check_privacy.py 认 `# privacy-allow` 逐行豁免,
+    CI 的 git 历史扫描不认 —— 本地全绿、推上去 CI 红,而且历史一旦进去就
+    只能重写历史才能变绿。豁免一行的代价因此不是"跳过一次检查",
+    而是"这一行永久卡住 CI"。
+
+    所以规则是:**被 pragma 豁免的 9 位数字,必须同时是 CI 认可的占位形态。**
+    pragma 只能用来豁免占位值,不能用来夹带真实号 —— 后者仍会被 CI 拦下。
+    """
+
+    def _ci_placeholder_re(self) -> re.Pattern:
+        """从 workflow 文件里解析出 CI 用的占位值正则 —— 不复制一份。
+
+        复制等于制造第二个真相来源:改了 CI 没改测试,这个测试就在保护一个
+        已经不存在的规则。
+        """
+        wf = (ROOT / ".github/workflows/no-user-data.yml").read_text(encoding="utf-8")
+        m = re.search(r"^\s*PLACEHOLDERS='([^']+)'", wf, re.M)
+        self.assertIsNotNone(m, "workflow 里找不到 PLACEHOLDERS —— 变量名改了就得同步这里")
+        return re.compile(m.group(1))
+
+    def test_pragma_exempted_digits_are_ci_placeholders(self):
+        ci_ok = self._ci_placeholder_re()
+        nine = re.compile(r"(?<![0-9])[0-9]{9}(?![0-9])")
+        offenders = []
+        for rel in check_privacy.tracked_files():
+            path = ROOT / rel
+            if not path.is_file():
+                continue
+            try:
+                text = path.read_text(encoding="utf-8")
+            except (UnicodeDecodeError, OSError):
+                continue
+            for i, line in enumerate(text.splitlines(), 1):
+                if check_privacy.PRAGMA not in line:
+                    continue
+                for val in nine.findall(line):
+                    if not ci_ok.search(val):
+                        offenders.append(f"{rel}:{i}:{val}")
+        self.assertEqual(
+            offenders, [],
+            "这些行被 pragma 豁免,但不是 CI 认可的占位形态 —— "
+            "本地会过、CI 会红:\n" + "\n".join(offenders),
+        )
 
 
 if __name__ == "__main__":

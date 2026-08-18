@@ -508,6 +508,13 @@ def check_evidence_size(r: Result, cfg: dict, order: dict) -> None:
         return
 
     scale, why = rule_size_tier(rule, ex)
+    # guarded_live:刚开真钱的阶段,仓位统一压到最低档,不管规则状态多好。
+    # 这样"开了真钱"和"放开仓位"是两个独立决定,可以先只做前一个。
+    if str(ex.get("live_mode", "guarded")) == "guarded":
+        capped = min(scale, observe_scale)
+        if capped < scale:
+            why += f" · live_mode=guarded 压到 ×{capped:g}"
+        scale = capped
     if scale == 0.0:
         r.add("证据尺寸", False, f"主依据已停用:{why}",
               hint="refuted / retired 的规则只保留历史,不参与决策。")

@@ -36,6 +36,12 @@ dry_run = true
 # 是无法关闭的硬条件(见 AGENTS.md 铁律)。
 require_confirmation = true
 
+# 真钱执行的两档。开真钱与放开仓位是**两个独立决定**:
+#   "guarded"     刚开真钱:仓位统一压到 size_scale_observe,不管规则状态多好
+#   "autonomous"  运行健康、你确认之后:仓位按规则 status 缩放
+# 由 scripts/setup.py --authorize-live 设置,不建议手改。
+live_mode = "guarded"
+
 # --- 硬性金额闸门(由 scripts/preflight.py 强制,不依赖 agent 自觉)---
 # 这四条是**无条件**的:不随证据强度变化,任何规则都绕不过。
 # 开启自动交易前先确认它们是你能承受单日全损的量级。
