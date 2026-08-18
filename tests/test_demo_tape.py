@@ -121,8 +121,8 @@ class TestTapeUsesOnlyDemoData(unittest.TestCase):
         把账户号后 4 位录进了公开 gif。gif 是二进制,进仓后既难审计也难撤回。"""
         for cmd in typed_commands():
             if "preflight.py" in cmd:
-                self.assertIn("--profile demo/", cmd,
-                              f"录制里的 preflight 必须用演示配置:{cmd}")
+                self.assertIn("--demo", cmd,
+                              f"录制里的 preflight 必须用 --demo(强制演示配置):{cmd}")
 
     def test_demo_shows_onboarding_and_the_gate(self):
         """演示只需要回答新用户的两个问题:我该干什么、它凭什么值得托付。

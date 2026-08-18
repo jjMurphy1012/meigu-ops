@@ -3,6 +3,9 @@
 #   brew install vhs
 #   make demo            # → docs/demo.gif
 #
+# ⚠️ 录制前先 bump VERSION:仪表盘之类的界面会把版本号打在画面上,
+#    先录后 bump 会让 gif 里的版本号比 release 落后一版(v5.10.0 时发生过)。
+#
 # 只演两件事,因为新用户只需要先明白两件事:
 #   ① clone 之后我该干什么      → 接入状态机告诉你在第几步
 #   ② 它凭什么值得托付真钱      → 闸门真的会拦下一笔坏单
@@ -57,7 +60,7 @@ Type "# 到点后 AI 自己分析、自己决定。但下单前必须过闸门:"
 Enter
 Sleep 1400ms
 
-Type "python3 scripts/preflight.py --order-file demo/order-oversized-trim.json --profile demo/profile-demo.toml --tags examples/sample-reason-tags.toml --now-et '2026-08-18 13:05'"
+Type "python3 scripts/preflight.py --order-file demo/order-oversized-trim.json --demo --tags examples/sample-reason-tags.toml --now-et '2026-08-18 13:05'"
 Sleep 300ms
 Enter
 Sleep 6500ms

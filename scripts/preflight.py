@@ -229,19 +229,33 @@ def validate_order(order: dict) -> list[str]:
     elif not isinstance(td, list):
         errs.append(f"today_orders 必须是数组,实际 {type(td).__name__}")
     else:
+        # 子项必须结构完整:少了 symbol 就漏掉"同标的当日重复",
+        # 少了 side 就漏掉买卖方向的当日累计。半条记录比没有记录更危险 ——
+        # 它让闸门以为自己算过了。
         for i, o in enumerate(td):
             if not isinstance(o, dict):
                 errs.append(f"today_orders[{i}] 必须是对象")
                 continue
+            if not str(o.get("symbol", "")).strip():
+                errs.append(f"today_orders[{i}] 缺少 symbol —— 无法判定同标的当日重复")
+            if str(o.get("side", "")).lower() not in ("buy", "sell"):
+                errs.append(f"today_orders[{i}].side 必须是 buy 或 sell,"
+                            f"实际 {o.get('side')!r} —— 无法归集当日累计")
             a = o.get("amount", o.get("amount_usd"))
-            if a is not None:
+            if a is None:
+                errs.append(f"today_orders[{i}] 缺少 amount")
+            else:
                 _num(a, f"today_orders[{i}].amount", errs)
 
+    # ★ 持仓字段允许 0:买一只**从没持有过**的股票时,市值与股数本来就是 0。
+    # 旧实现要求 > 0,于是新标的买入进了死锁:不给 position → 风控数据不完整;
+    # 给 0 → 订单结构非法。两条路都堵死,系统只能加仓、不能开新仓。
+    # 卖出侧的"必须真的有货"由「持仓股数」闸门单独把关,不靠结构层。
     for key in ("position.market_value", "position.qty", "position.avg_cost"):
         head, tail = key.split(".")
         src = order.get(head)
         if isinstance(src, dict) and tail in src:
-            _num(src[tail], key, errs, positive=(tail != "avg_cost"))
+            _num(src[tail], key, errs, positive=False)
     pf = order.get("portfolio")
     if isinstance(pf, dict):
         for k in ("buying_power", "total_value", "equity_value", "cash"):
@@ -569,6 +583,12 @@ def check_size(r: Result, cfg: dict, order: dict) -> None:
     if side == "sell":
         held = (order.get("position") or {}).get("qty")
         want = order.get("qty")
+        mv = (order.get("position") or {}).get("market_value")
+        if (held is not None and float(held) <= 0) or (mv is not None and float(mv) <= 0):
+            r.add("持仓股数", False,
+                  f"卖出但持仓为空(qty={held}, market_value={mv})",
+                  hint="没有持仓就没有可卖的东西 —— 先确认 get_equity_positions 的读数。")
+            return
         if want is not None and held is None:
             # ★ 旧实现:两边都有 qty 才比。于是"报了股数、不报持仓"直接免检 ——
             # 缺字段又一次变成免检通道。
@@ -1014,6 +1034,36 @@ def print_report(r: Result, cfg: dict, order: dict) -> None:
         print(f"\n⚠️  {len(r.warnings)} 项提醒(不阻断,但要在汇报里说明)。")
 
 
+DEMO_PROFILE = "demo/profile-demo.toml"
+
+
+def _demo_config() -> dict:
+    """演示配置 —— 路径写死,且必须满足三个条件才允许使用。
+
+    ★ 为什么不做成 `--profile <任意路径>`:那等于给下单路径开了一个
+    "自带风控配置"的入口。评审实测过:临时 profile 把单笔上限改成 $100,000,
+    一笔本该 DENY 的 $500 买单就变成了 ALLOW。
+    **能被调用方替换的上限不是上限。**
+    """
+    import tomllib
+
+    path = ROOT / DEMO_PROFILE
+    if not path.exists():
+        raise ConfigError(f"演示配置不存在:{DEMO_PROFILE}")
+    with path.open("rb") as fh:
+        cfg = tomllib.load(fh)
+
+    ex = cfg.get("execution", {})
+    acct = str(cfg.get("account", {}).get("id", "")).strip()
+    if ex.get("dry_run") is not True:
+        raise ConfigError(f"{DEMO_PROFILE} 必须 dry_run = true")
+    if acct not in ("", "000000000", "111111111"):
+        raise ConfigError(f"{DEMO_PROFILE} 必须使用占位账户号,实际 ***{acct[-4:]}")
+    cfg["_source"] = DEMO_PROFILE
+    cfg["_is_demo"] = True
+    return cfg
+
+
 def write_drill_evidence(order: dict, r: Result) -> None:
     """把本次判定写进演练证据日志。
 
@@ -1034,19 +1084,15 @@ def write_drill_evidence(order: dict, r: Result) -> None:
             return
         if str(order["drill_run_id"]).strip() != active["run_id"]:
             return                       # 对不上就不写,也不报错
-        rec = append_drill_evidence(
+        # 一次构造完整记录再追加。旧实现"先追加、再读全文改最后一行、整体写回"
+        # 有并发覆盖窗口:两个进程同时跑时会改错行,或覆盖掉对方刚写的记录。
+        append_drill_evidence(
             "preflight",
             f"{order.get('side')} {order.get('symbol')} → {r.verdict}",
+            ok=r.verdict != DENY,
+            verdict=r.verdict,
+            blockers=[c.name for c in r.blockers],
         )
-        if rec:
-            from setup import DRILL_LOG
-
-            lines = DRILL_LOG.read_text(encoding="utf-8").splitlines()
-            last = json.loads(lines[-1])
-            last["verdict"] = r.verdict
-            last["blockers"] = [c.name for c in r.blockers]
-            lines[-1] = json.dumps(last, ensure_ascii=False)
-            DRILL_LOG.write_text("\n".join(lines) + "\n", encoding="utf-8")
     except Exception:                             # noqa: BLE001
         pass
 
@@ -1059,15 +1105,26 @@ def main(argv: list[str] | None = None) -> int:
     src.add_argument("--stdin", action="store_true", help="从 stdin 读订单 JSON")
     src.add_argument("--order-file", help="订单 JSON 文件路径")
     ap.add_argument("--json", action="store_true", help="JSON 输出")
-    ap.add_argument("--now-et", help="覆盖当前 ET 时间(测试用),YYYY-MM-DD HH:MM")
-    ap.add_argument("--tags", help="指定理由标签词表文件(演示/测试用,默认读 config/)")
-    ap.add_argument("--profile", help="指定配置文件(演示/测试用,默认读 config/profile.toml)")
+    # ★ 这三个参数只能配合 --demo 使用,原因见 _demo_config()。
+    ap.add_argument("--demo", action="store_true",
+                    help="演示模式:强制读 demo/profile-demo.toml,结果永不为 ALLOW")
+    ap.add_argument("--now-et", help="覆盖当前 ET 时间(仅 --demo),YYYY-MM-DD HH:MM")
+    ap.add_argument("--tags", help="指定理由标签词表文件(仅 --demo)")
     ap.add_argument("--example", action="store_true", help="打印订单 JSON 模板并退出")
     args = ap.parse_args(argv)
 
     if args.example:
         print(json.dumps(EXAMPLE_ORDER, ensure_ascii=False, indent=2))
         return 0
+
+    # 时间与词表是风控输入,不是显示选项:
+    # `--now-et` 能绕开报价新鲜度、意图时效与交易时段;`--tags` 能绕开理由标签闸门。
+    # 真钱路径上不该存在这样的开关,所以它们只在 --demo 下可用。
+    for flag, val in (("--now-et", args.now_et), ("--tags", args.tags)):
+        if val and not args.demo:
+            print(f"❌ {flag} 只能配合 --demo 使用 —— 它会改变风控判定的输入。",
+                  file=sys.stderr)
+            return 2
 
     if not args.stdin and not args.order_file:
         ap.error("需要 --stdin 或 --order-file 之一(或用 --example 看模板)")
@@ -1087,14 +1144,12 @@ def main(argv: list[str] | None = None) -> int:
         print("\n模板:python3 scripts/preflight.py --example", file=sys.stderr)
         return 2
 
-    if args.profile:
-        # 演示/测试用:不读真实 config/profile.toml。
-        # 录制 gif 时这不是可选项 —— 真实配置里的账户号会被录进公开仓。
-        import tomllib
-
-        with Path(args.profile).open("rb") as fh:
-            cfg = tomllib.load(fh)
-        cfg["_source"] = args.profile
+    if args.demo:
+        try:
+            cfg = _demo_config()
+        except ConfigError as exc:
+            print(f"❌ {exc}", file=sys.stderr)
+            return 2
     else:
         cfg = load_config("profile", required=False)
     try:
@@ -1105,6 +1160,9 @@ def main(argv: list[str] | None = None) -> int:
 
     vocab = load_vocabulary(path=Path(args.tags)) if args.tags else None
     r = run(order, cfg, now, vocab=vocab)
+    if args.demo and r.verdict == ALLOW:
+        # 演示永远不该输出"可以下单" —— 那是会被截图传播的一句话。
+        r.verdict = DRY_RUN
     write_drill_evidence(order, r)
 
     if args.json:

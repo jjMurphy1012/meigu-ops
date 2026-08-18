@@ -489,7 +489,7 @@ class TestCli(unittest.TestCase):
                                          encoding="utf-8") as fh:
             _json.dump(BASE_ORDER, fh)
             path = fh.name
-        code, out = self._main(["--order-file", path, "--json",
+        code, out = self._main(["--order-file", path, "--json", "--demo",
                                 "--now-et", "2026-08-18 13:00"])
         payload = _json.loads(out)
         self.assertIn(payload["verdict"], (ALLOW, DRY_RUN, DENY))
@@ -504,8 +504,61 @@ class TestCli(unittest.TestCase):
                                          encoding="utf-8") as fh:
             _json.dump(bad, fh)
             path = fh.name
-        code, _ = self._main(["--order-file", path, "--now-et", "2026-08-18 13:00"])
+        code, _ = self._main(["--order-file", path, "--demo",
+                              "--now-et", "2026-08-18 13:00"])
         self.assertEqual(code, 1)
+
+    def test_time_and_tag_overrides_require_demo(self):
+        """★ 这两个参数会改变风控判定的输入 —— 真钱路径上不该存在这种开关。
+
+        评审实测:临时 profile 把单笔上限改成 $100,000,一笔本该 DENY 的
+        $500 买单就变成了 ALLOW。**能被调用方替换的上限不是上限。**
+        """
+        import json as _json
+        import tempfile
+
+        with tempfile.NamedTemporaryFile("w", suffix=".json", delete=False,
+                                         encoding="utf-8") as fh:
+            _json.dump(BASE_ORDER, fh)
+            path = fh.name
+        for extra in (["--now-et", "2026-08-18 13:00"],
+                      ["--tags", "examples/sample-reason-tags.toml"]):
+            with self.subTest(flag=extra[0]):
+                code, _ = self._main(["--order-file", path] + extra)
+                self.assertEqual(code, 2, f"{extra[0]} 不带 --demo 应当被拒绝")
+
+    def test_profile_flag_no_longer_exists(self):
+        """`--profile <任意路径>` 等于给下单路径开一个"自带风控配置"的入口。"""
+        self.assertNotIn("--profile", preflight.main.__doc__ or "")
+        import argparse
+        import contextlib
+        import io
+
+        buf = io.StringIO()
+        with contextlib.redirect_stderr(buf), self.assertRaises(SystemExit):
+            preflight.main(["--order-file", "x.json", "--profile", "/tmp/evil.toml"])
+        self.assertIn("unrecognized arguments", buf.getvalue())
+
+    def test_demo_never_returns_allow(self):
+        """演示不该输出"可以下单" —— 那是会被截图传播的一句话。"""
+        import json as _json
+        import tempfile
+
+        clean = dict(BASE_ORDER)
+        with tempfile.NamedTemporaryFile("w", suffix=".json", delete=False,
+                                         encoding="utf-8") as fh:
+            _json.dump(clean, fh)
+            path = fh.name
+        code, out = self._main(["--order-file", path, "--json", "--demo",
+                                "--tags", "examples/sample-reason-tags.toml",
+                                "--now-et", "2026-08-18 13:00"])
+        self.assertNotEqual(_json.loads(out)["verdict"], ALLOW)
+
+    def test_demo_profile_is_locked_down(self):
+        """演示配置必须 dry_run + 占位账户,否则 --demo 直接拒绝启动。"""
+        cfg = preflight._demo_config()
+        self.assertIs(cfg["execution"]["dry_run"], True)
+        self.assertEqual(cfg["account"]["id"], "000000000")
 
     def test_malformed_json_exits_two(self):
         import tempfile

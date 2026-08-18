@@ -205,5 +205,29 @@ class TestScannersAgree(unittest.TestCase):
         )
 
 
+class TestTestFilesAreFullyLoadable(unittest.TestCase):
+    """★ 每个测试文件直接执行时,必须加载到全部用例。
+
+    2026-08-18 两次踩到同一个坑:补丁脚本把新用例插到了 `unittest.main()`
+    **之前**,于是 `python tests/test_x.py` 只跑到中途就退出,给出虚假的全绿。
+    CI 用 discover 所以是绿的,本地直接跑却少一半 —— 这种不一致比直接失败更危险。
+    """
+
+    def test_no_class_defined_after_main_guard(self):
+        offenders = []
+        for path in sorted((ROOT / "tests").glob("test_*.py")):
+            lines = path.read_text(encoding="utf-8").splitlines()
+            guard = next((i for i, l in enumerate(lines)
+                          if l.startswith('if __name__ == "__main__":')), None)
+            if guard is None:
+                continue
+            after = [i + 1 for i, l in enumerate(lines[guard:], start=guard)
+                     if l.startswith("class ")]
+            if after:
+                offenders.append(f"{path.name}: main guard 在第 {guard + 1} 行,"
+                                 f"但第 {after[0]} 行还有 class")
+        self.assertEqual(offenders, [], "\n".join(offenders))
+
+
 if __name__ == "__main__":
     unittest.main()

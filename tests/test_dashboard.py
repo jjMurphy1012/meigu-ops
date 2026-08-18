@@ -455,8 +455,6 @@ class TestCli(unittest.TestCase):
         self.assertIn("examples/", data.snapshot.source)
 
 
-if __name__ == "__main__":
-    unittest.main()
 
 
 class TestReportSkeletonIsConfigDriven(unittest.TestCase):
@@ -522,3 +520,7 @@ class TestReportSkeletonIsConfigDriven(unittest.TestCase):
                  "THEMES_SECTION", "TECHNICALS_SECTION", "GROUP_NEWS_SECTION",
                  "WATCHLIST_SECTION", "WATCH_LEVELS_SECTION", "RISK_SECTION"}
         self.assertEqual(tokens - known, set(), "模板里有无人填充的占位符")
+
+
+if __name__ == "__main__":
+    unittest.main()

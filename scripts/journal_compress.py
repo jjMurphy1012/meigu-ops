@@ -197,6 +197,7 @@ def _record_drill_stage(report: Report) -> None:
             "journal",
             f"条目 {len(report.entries)} 条 · {report.total_lines} 行 · "
             f"{'结构合法' if report.ok else f'{len(report.errors)} 处结构错误'}",
+            ok=report.ok,          # 校验失败必须如实写下,不能只留个 stage 名
         )
     except Exception:                             # noqa: BLE001
         pass

@@ -274,8 +274,6 @@ class TestNoBuiltInStrategy(unittest.TestCase):
             self.assertIn(r.test_type, ("enforced_by", "manual"), r.id)
 
 
-if __name__ == "__main__":
-    unittest.main()
 
 
 class TestWriteCommands(unittest.TestCase):
@@ -527,3 +525,7 @@ last_audited = ""
         r = load_rules(path=self.path)[0][0]
         self.assertEqual(r.scope, "live")
         self.assertTrue(r.may_authorize_live)
+
+
+if __name__ == "__main__":
+    unittest.main()

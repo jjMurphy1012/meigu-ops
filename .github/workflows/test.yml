@@ -11,18 +11,29 @@ permissions:
 
 jobs:
   test:
-    runs-on: ubuntu-latest
+    # README 声称三平台可用 —— 那就得由 CI 证明,而不是靠代码审查下结论。
+    runs-on: ${{ matrix.os }}
     strategy:
       fail-fast: false
       matrix:
+        os: [ubuntu-latest, macos-latest, windows-latest]
         # 3.11 是下限(tomllib 进标准库的版本);3.13 是当前开发环境。
         python-version: ["3.11", "3.13"]
+    defaults:
+      run:
+        shell: bash          # Windows 上用 Git Bash,让脚本片段三平台通用
     steps:
       - uses: actions/checkout@v4
 
       - uses: actions/setup-python@v5
         with:
           python-version: ${{ matrix.python-version }}
+
+      - name: Windows 装时区数据库
+        if: runner.os == 'Windows'
+        # Windows 没有系统时区库,而本项目所有时间判断都基于 ET。
+        # 这是唯一一个平台相关依赖,也是 README 里唯一要求 Windows 用户装的东西。
+        run: pip install tzdata
 
       - name: 确认零第三方依赖
         run: |
@@ -38,6 +49,14 @@ jobs:
       - name: 单元测试
         run: PYTHONPATH=scripts python -m unittest discover -s tests -v
 
+      - name: 时区数据库可用(三平台都要过)
+        run: |
+          python - <<'PY'
+          from zoneinfo import ZoneInfo
+          import datetime as dt
+          print("ET now:", dt.datetime.now(ZoneInfo("America/New_York")))
+          PY
+
       - name: 脚本冒烟测试
         run: |
           python scripts/trading_day.py 2026-08-18
@@ -48,9 +67,11 @@ jobs:
           python scripts/stats.py --demo --json > /dev/null
           python scripts/rules.py --file config/rules.example.toml
           python scripts/preflight.py --example > /dev/null
+          # 静态渲染三平台通用(curses 只在交互式 TUI 里用,Windows 上不走这条路)
           for tab in 组合 台账 纪律; do
             python scripts/dashboard.py --demo --render "$tab" --width 100 --height 30 > /dev/null
           done
+          python scripts/setup.py --demo > /dev/null
           echo '{"portfolio":{"total":1}}' | python scripts/snapshot.py --stdin --checkpoint ci
           python scripts/snapshot.py --list
 

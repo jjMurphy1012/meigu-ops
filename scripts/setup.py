@@ -528,7 +528,8 @@ def start_drill() -> str:
 MACHINE_VERIFIED_STAGES = ("preflight", "journal", "review")
 
 
-def append_drill_evidence(stage: str, detail: str = "") -> bool:
+def append_drill_evidence(stage: str, detail: str = "", *,
+                          ok: bool = True, **extra) -> bool:
     """由各阶段的脚本调用,为**当前 active run** 追加一行证据。
 
     ★ 关键约束:run id 不由调用方指定,而是从 state 里读当前 active run。
@@ -543,12 +544,18 @@ def append_drill_evidence(stage: str, detail: str = "") -> bool:
         "nonce": active.get("nonce", ""),
         "account_fp": active.get("account_fp", ""),
         "stage": stage,
+        "ok": bool(ok),                 # ★ 环节自己的成败,不是"跑过就算过"
         "at": now_et().strftime("%Y-%m-%d %H:%M:%S ET"),
         "detail": detail,
+        **extra,
     }
+    # 一次构造完整记录再单次追加。旧实现是"先追加、再读全文改最后一行、整体写回",
+    # 并发跑两个脚本时会改错记录、甚至覆盖掉另一个进程刚写的行。
     DRILL_LOG.parent.mkdir(parents=True, exist_ok=True)
     with DRILL_LOG.open("a", encoding="utf-8") as fh:
         fh.write(json.dumps(rec, ensure_ascii=False) + "\n")
+        fh.flush()
+        os.fsync(fh.fileno())
     return True
 
 
@@ -639,7 +646,16 @@ def record_drill(payload: dict) -> str:
             f"run {run_id} 有 {len(ev)} 条证据,但没有一条是判定为 DRY_RUN 的 preflight —— "
             f"演练要求走完闸门并停在模拟下单。"
         )
-    stages = {e.get("stage") for e in ev}
+    # ★ "跑过"不等于"跑通"。日志结构校验失败也会留下一条 journal 证据,
+    # 旧实现只看 stage 名字在不在,于是一份结构损坏的日志照样算演练通过。
+    stages = {e.get("stage") for e in ev if e.get("ok") is not False}
+    failed = sorted({e.get("stage") for e in ev if e.get("ok") is False}
+                    & set(MACHINE_VERIFIED_STAGES))
+    if failed:
+        raise ConfigError(
+            f"以下环节跑过但**没通过**:{'、'.join(failed)}\n"
+            f"  先把它们修到通过,再记录演练 —— 演练的意义是证明链路是通的。"
+        )
     lack = [s for s in MACHINE_VERIFIED_STAGES if s not in stages]
     if lack:
         raise ConfigError(

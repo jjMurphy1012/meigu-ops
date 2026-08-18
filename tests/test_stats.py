@@ -232,8 +232,6 @@ class TestSummarize(unittest.TestCase):
         self.assertAlmostEqual(s["by_month"]["2026-08"]["pnl"], 10.0)
 
 
-if __name__ == "__main__":
-    unittest.main()
 
 
 class TestOptionalRuleIdsColumn(unittest.TestCase):
@@ -253,3 +251,7 @@ class TestOptionalRuleIdsColumn(unittest.TestCase):
     def test_too_few_columns_still_rejected(self):
         with self.assertRaises(LedgerError):
             parse_trades(tsv("2026-08-01\t10:33\tX\tbuy"), vocab=TEST_VOCAB)
+
+
+if __name__ == "__main__":
+    unittest.main()

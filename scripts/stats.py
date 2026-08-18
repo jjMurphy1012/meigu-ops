@@ -341,7 +341,8 @@ def main(argv: list[str] | None = None) -> int:
         try:
             from setup import append_drill_evidence
 
-            append_drill_evidence("review", f"台账 {len(trades)} 笔已解析并统计")
+            append_drill_evidence("review", f"台账 {len(trades)} 笔已解析并统计",
+                                  ok=len(trades) > 0)
         except Exception:                         # noqa: BLE001
             pass
 
