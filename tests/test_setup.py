@@ -200,11 +200,22 @@ class TestDrillRecord(unittest.TestCase):
         self.dir = sandbox(self)
         stub_prereqs(self)
 
-    def _evidence(self, run_id: str, verdict: str = "DRY_RUN"):
-        S.DRILL_LOG.write_text(
-            json.dumps({"run_id": run_id, "verdict": verdict, "symbol": "AAAA"}) + "\n",
-            encoding="utf-8",
-        )
+    def _evidence(self, run_id: str, verdict: str = "DRY_RUN",
+                  stages=("preflight", "journal", "review")):
+        """模拟各阶段脚本写下的机器证据。
+
+        run id / nonce / 账户指纹都取自当前 active run —— 这正是要验证的绑定关系。
+        """
+        for stage in stages:
+            S.append_drill_evidence(stage, "test")
+        if "preflight" in stages:
+            lines = S.DRILL_LOG.read_text(encoding="utf-8").splitlines()
+            for i, ln in enumerate(lines):
+                rec = json.loads(ln)
+                if rec.get("stage") == "preflight":
+                    rec["verdict"] = verdict
+                    lines[i] = json.dumps(rec, ensure_ascii=False)
+            S.DRILL_LOG.write_text("\n".join(lines) + "\n", encoding="utf-8")
 
     def test_drill_with_real_evidence_is_recorded(self):
         rid = S.start_drill()
@@ -214,8 +225,40 @@ class TestDrillRecord(unittest.TestCase):
         self.assertTrue(rec["passed"])
         self.assertEqual(rec["run_id"], rid)
 
+    def test_only_preflight_evidence_is_not_a_full_drill(self):
+        """只证明 preflight 跑过,不等于端到端演练跑过。"""
+        rid = S.start_drill()
+        self._evidence(rid, stages=("preflight",))
+        with self.assertRaises(ConfigError) as cm:
+            S.record_drill(full_drill())
+        self.assertIn("机器证据", str(cm.exception))
+
+    def test_drill_without_start_is_rejected(self):
+        """★ 没跑过 --start-drill,自造 run id 也不行 —— 证据链的锚点
+        不能由被验证方指定。"""
+        S.DRILL_LOG.write_text(
+            json.dumps({"run_id": "made-up", "stage": "preflight",
+                        "verdict": "DRY_RUN"}) + "\n", encoding="utf-8")
+        with self.assertRaises(ConfigError) as cm:
+            S.record_drill(full_drill(run_id="made-up"))
+        self.assertIn("没有进行中的演练", str(cm.exception))
+
+    def test_same_run_cannot_be_recorded_twice(self):
+        rid = S.start_drill()
+        self._evidence(rid)
+        S.record_drill(full_drill())
+        with self.assertRaises(ConfigError):
+            S.record_drill(full_drill(run_id=rid))
+
+    def test_string_false_is_not_true(self):
+        """★ 非空字符串在 Python 里为真 —— 必须严格比 True。"""
+        rid = S.start_drill()
+        self._evidence(rid)
+        with self.assertRaises(ConfigError):
+            S.record_drill({k: "false" for k in S.DRILL_CHECKS})
+
     def test_booleans_alone_are_not_enough(self):
-        """六个 true 但从没跑过 preflight —— 必须拒绝。"""
+        """六个 true 但从没跑过任何脚本 —— 必须拒绝。"""
         S.start_drill()
         with self.assertRaises(ConfigError) as cm:
             S.record_drill(full_drill())
@@ -272,6 +315,23 @@ class TestPrerequisitesForDrill(unittest.TestCase):
         self.assertIn("前置步骤", str(cm.exception))
 
 
+class TestStrictTruth(unittest.TestCase):
+    """★ 对抗测试原文:九项检查全部提交字符串 "false",系统仍记录"验证通过"。"""
+
+    def setUp(self):
+        self.dir = sandbox(self)
+
+    def test_string_false_does_not_pass_mcp_checks(self):
+        with self.assertRaises(ConfigError):
+            S.record_mcp({k: "false" for k in S.MCP_CHECKS}
+                         | {"account_id": "555000111"})     # privacy-allow
+
+    def test_truthy_non_bool_does_not_pass(self):
+        with self.assertRaises(ConfigError):
+            S.record_mcp({k: 1 for k in S.MCP_CHECKS}
+                         | {"account_id": "555000111"})     # privacy-allow
+
+
 class TestAccountFingerprint(unittest.TestCase):
     """★ 换了账户,之前的验证就必须失效。
 
@@ -306,8 +366,12 @@ class TestAccountFingerprint(unittest.TestCase):
     def test_changing_account_invalidates_drill(self):
         stub_prereqs(self)
         rid = S.start_drill()
-        S.DRILL_LOG.write_text(json.dumps({"run_id": rid, "verdict": "DRY_RUN"}) + "\n",
-                               encoding="utf-8")
+        for stage in ("preflight", "journal", "review"):
+            S.append_drill_evidence(stage, "test")
+        lines = S.DRILL_LOG.read_text(encoding="utf-8").splitlines()
+        rec = json.loads(lines[0]); rec["verdict"] = "DRY_RUN"
+        lines[0] = json.dumps(rec, ensure_ascii=False)
+        S.DRILL_LOG.write_text("\n".join(lines) + "\n", encoding="utf-8")
         S.record_drill(full_drill())
         self.assertTrue(S.check_automation(S._load_state()).ok)
 

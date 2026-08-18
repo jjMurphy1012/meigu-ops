@@ -336,6 +336,15 @@ def main(argv: list[str] | None = None) -> int:
         )
         return 2
 
+    if not args.demo:
+        # 演练进行中时为 review 环节留一条机器证据;不在演练中则无感。
+        try:
+            from setup import append_drill_evidence
+
+            append_drill_evidence("review", f"台账 {len(trades)} 笔已解析并统计")
+        except Exception:                         # noqa: BLE001
+            pass
+
     if args.since:
         since = dt.date.fromisoformat(args.since)
         trades = [t for t in trades if t.date >= since]

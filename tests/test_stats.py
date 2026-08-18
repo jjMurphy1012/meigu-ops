@@ -57,7 +57,7 @@ class TestParse(unittest.TestCase):
         self.assertEqual(len(parse_trades(p, vocab=TEST_VOCAB)), 1)
 
     def test_missing_file_returns_empty(self):
-        self.assertEqual(parse_trades(Path("/nonexistent/trades.tsv", vocab=TEST_VOCAB)), [])
+        self.assertEqual(parse_trades(Path("/nonexistent/trades.tsv"), vocab=TEST_VOCAB), [])
 
     def test_normalizes_symbol_case_and_currency(self):
         p = tsv(row("2026-08-06", "10:33", "aaaa", "BUY", 1, "$300.50", "$300.50", "建仓"))

@@ -185,6 +185,23 @@ def analyze(text: str, cfg: dict, ref_date: dt.date | None = None) -> Report:
     return Report(total_lines, max_lines, entries, errors, warnings, plan)
 
 
+def _record_drill_stage(report: Report) -> None:
+    """演练进行中时,为 journal 环节留一条机器证据。
+
+    不在演练中就什么都不做 —— 这个函数对日常使用完全无感。
+    """
+    try:
+        from setup import append_drill_evidence
+
+        append_drill_evidence(
+            "journal",
+            f"条目 {len(report.entries)} 条 · {report.total_lines} 行 · "
+            f"{'结构合法' if report.ok else f'{len(report.errors)} 处结构错误'}",
+        )
+    except Exception:                             # noqa: BLE001
+        pass
+
+
 def main(argv: list[str] | None = None) -> int:
     ap = argparse.ArgumentParser(description="交易日志结构校验与压缩规划")
     ap.add_argument("--check", action="store_true", help="只校验结构,不输出压缩计划")
@@ -236,6 +253,8 @@ def main(argv: list[str] | None = None) -> int:
         print("\n⚠️  提醒:")
         for w in report.warnings:
             print(f"  · {w}")
+
+    _record_drill_stage(report)
 
     if not args.check:
         if report.plan:

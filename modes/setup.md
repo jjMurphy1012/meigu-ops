@@ -102,7 +102,10 @@ cp config/profile.example.toml config/profile.toml
 | `max_orders_per_day` | 单日最多几笔? |
 | `kill_switch_file` | 紧急停止用哪个文件?(默认 `data/HALTED`) |
 
-**这四条是无条件的**:不随证据强度变化,任何规则都绕不过。
+**这四条不随证据强度变化,任何规则都绕不过** —— 但对买入和卖出不对称:
+金额类上限只无条件约束买入,卖出由持仓市值封顶;`intent=close` 的清仓
+还可豁免笔数与同标的重复(代价是必须提供持仓数据且数量要吻合)。
+**风控如果能阻止你降低风险,它就不是风控。**
 建议按"单日全损也能承受"的量级来定。
 
 执行开关此时仍然全部关闭 —— 这一步只是配置,不是授权。
@@ -180,8 +183,19 @@ python3 scripts/setup.py --start-drill      # 打印 run id
 然后完整跑一遍:盘前(`premarket`)→ 盘中(`check`)→ `preflight` → 模拟下单
 (走完 `review`,**不 `place`**)→ 尾盘日志与台账(`journal`)→ 复盘审计(`review`)。
 
-**跑 preflight 时在订单 JSON 里加 `"drill_run_id": "<run id>"`** ——
-preflight 会把判定写进 `data/drill-runs.jsonl`,那才是演练真的发生过的证据。
+**三个环节会留下机器证据**,缺一不可:
+
+| 环节 | 怎么留证据 |
+|---|---|
+| `preflight` | 订单 JSON 里加 `"drill_run_id": "<run id>"` |
+| `journal` | 跑 `make journal-check` |
+| `review` | 跑 `make stats` |
+
+证据写进 `data/drill-runs.jsonl`。**run id 由脚本从 state 里读,不采信订单里的值** ——
+否则不跑 `--start-drill`、自造一个 id 就能凭空造出证据。
+
+`premarket` 与 `check` 没有对应脚本,只能由你自报 —— 记录里会如实标注哪些是
+机器验证、哪些是自报,不会把两者混成一句"演练通过"。
 
 跑通后写回:
 
@@ -196,8 +210,12 @@ JSON
 ```
 
 **六个布尔值不足以记成完成。** 脚本还会核对:前三步确实就绪、当前确实处于
-dry_run、以及**存在判定为 `DRY_RUN` 的 preflight 证据行**。
-让被检查方自己出具检查结论,等于没有检查 —— 所以证据由闸门写,不由 agent 报。
+dry_run、存在**进行中的** run(没有就直接拒绝)、三个机器环节的证据齐全、
+其中 preflight 的判定确实是 `DRY_RUN`,且证据的 nonce 与账户指纹都对得上。
+记录成功后该 run 立即作废,同一次演练不能记两遍。
+
+让被检查方自己出具检查结论,等于没有检查 —— 所以证据由脚本写,不由 agent 报;
+布尔值必须是**原生 `true`**,字符串 `"false"` 在 Python 里为真,会被拒绝。
 
 演练的意义是把"配置对不对"和"链路通不通"分开验证。链路没跑通就开真钱,
 出问题时你分不清是策略错了还是管道漏了。

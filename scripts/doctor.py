@@ -212,6 +212,43 @@ def check_awake(r: Result) -> None:
         )
 
 
+def check_setup_state(r: Result) -> None:
+    """接入状态机的结论必须出现在 doctor 里。
+
+    ★ 否则会制造错误的安全感:doctor 说"全部必检项通过",而只读验证与
+    dry-run 演练根本没做过。两个入口对同一台机器给出不同结论时,
+    人会记住那个更好听的。
+
+    严重程度随配置而变 —— 这是刻意的:
+      · dry_run 阶段:提醒(还没做完是正常的)
+      · 真钱配置:必检失败(preflight 也会 DENY,这里提前告诉你)
+    """
+    try:
+        from setup import evaluate
+        from preflight import is_live
+
+        steps, _ = evaluate()
+        cfg = load_config("profile", required=False)
+        live = is_live(cfg)
+    except Exception as exc:                      # noqa: BLE001
+        r.add("接入状态", False, f"无法评估:{exc}", "跑 make setup 看详情")
+        return
+
+    bad = [s for s in steps if not s.ok]
+    if not bad:
+        r.add("接入状态", True, "六步全部就绪")
+        return
+    detail = "未完成:" + "、".join(s.state for s in bad)
+    if live:
+        r.add("接入状态", False, detail,
+              "配置已是真钱模式,但接入状态没走完 —— preflight 会对每一笔真单 DENY。"
+              "跑 make setup 补齐。")
+    else:
+        r.add("接入状态", False, detail,
+              "当前非真钱模式,所以只是提醒。开真钱前必须补齐(跑 make setup)。",
+              severity="warn")
+
+
 def check_permissions(r: Result) -> None:
     """策略授权 ≠ 工具放行 —— 未进白名单的工具会弹确认框,冻结整个会话。"""
     path = ROOT / ".claude" / "settings.local.json"
@@ -309,6 +346,7 @@ def main(argv: list[str] | None = None) -> int:
     r = Result()
     for fn in (
         check_python,
+        check_setup_state,
         check_clock,
         check_trading_day,
         check_configs,

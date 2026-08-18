@@ -190,6 +190,20 @@ def validate_execution(cfg: dict) -> list[str]:
         elif not (0 < v <= 1):
             errs.append(f"execution.{k} 必须落在 (0, 1],实际 {v} —— 尺寸系数不能放大基准上限")
 
+    for k in ("enabled", "dry_run", "require_confirmation"):
+        if k in ex and not isinstance(ex[k], bool):
+            errs.append(f"execution.{k} 必须是原生布尔值,实际 {ex[k]!r} —— "
+                        f'带引号的 "false" 会被当成真')
+
+    # 倍率必须单调不减:observe <= weak <= supported。
+    # 否则可以配出"越没证据仓位越大"的倒置关系,而每一项单独看都合法。
+    scales = [(k, ex.get(k)) for k in
+              ("size_scale_observe", "size_scale_weak", "size_scale_supported")]
+    got = [(k, v) for k, v in scales if isinstance(v, (int, float)) and not isinstance(v, bool)]
+    for (k1, v1), (k2, v2) in zip(got, got[1:]):
+        if v1 > v2:
+            errs.append(f"{k1}({v1})> {k2}({v2})—— 证据越强仓位反而越小,倍率关系倒置")
+
     mode = ex.get("live_mode", "guarded")
     if mode not in LIVE_MODES:
         errs.append(f"execution.live_mode 只能是 {' | '.join(LIVE_MODES)},实际 {mode!r}")
@@ -253,15 +267,19 @@ def check_mcp(state: dict) -> Step:
     todo = ["跑 `/meigu-ops setup`,由 agent 执行只读验证并写回结果",
             "只读:读账户 / 持仓 / 买力 / 带时间戳的报价 / review 可用",
             "**不要**调用 place_equity_order —— 这一步只确认能连上、连对账户"]
-    if not rec.get("passed"):
+    if rec.get("passed") is not True:
         return Step(MCP_CONNECTED_READONLY, False, "尚未完成券商 MCP 只读验证", todo)
 
     # ★ 指纹绑定:验证是针对**某一个具体账户**做的,换了账户就得重做。
     # 只存后 4 位不够 —— 后 4 位相同的两个账户会被认成同一个。
     cur = current_account_fingerprint()
     if not cur:
-        return Step(MCP_CONNECTED_READONLY, False,
-                    "配置里没有有效账户号 —— 之前的只读验证无从绑定", todo)
+        # ★ 这是"先 MCP、后 profile"的正常中间态,不是失败:
+        # 只读验证已经完成,只是还没有 profile 可以绑定。
+        # 旧实现把它判为未完成,于是流程倒退回第 2 步 —— 与公开文档的顺序矛盾。
+        return Step(MCP_CONNECTED_READONLY, True,
+                    f"已验证(账户 ***{rec.get('account_last4', '????')})· "
+                    f"**待绑定** —— 下一步把这个账户号填进 config/profile.toml")
     if rec.get("account_fp") != cur:
         return Step(
             MCP_CONNECTED_READONLY, False,
@@ -327,11 +345,11 @@ def check_strategy() -> Step:
 
 def check_automation(state: dict) -> Step:
     rec = state.get("drill") or {}
-    if rec.get("passed") and rec.get("account_fp") != current_account_fingerprint():
+    if rec.get("passed") is True and rec.get("account_fp") != current_account_fingerprint():
         return Step(AUTOMATION_READY, False,
                     "演练是针对另一个账户做的 —— 已自动失效",
                     ["对当前账户重新跑一遍 dry-run 演练"])
-    if not rec.get("passed"):
+    if rec.get("passed") is not True:
         return Step(
             AUTOMATION_READY, False, "尚未完成 dry-run 端到端演练",
             ["确认 execution.dry_run = true",
@@ -346,7 +364,7 @@ def check_live() -> Step:
     if not cfg:
         return Step(LIVE_AUTHORIZED, False, "配置不可读")
     ex = cfg.get("execution", {})
-    if not ex.get("enabled"):
+    if ex.get("enabled") is not True:
         return Step(LIVE_AUTHORIZED, False, "真钱执行未开启(这是默认且安全的状态)",
                     ["确认前面全部通过后,用 setup.py --authorize-live 开启"])
     mode = str(ex.get("live_mode", "guarded"))
@@ -354,8 +372,7 @@ def check_live() -> Step:
         return Step(LIVE_AUTHORIZED, False,
                     f"live_mode = {mode!r} 不是合法值 —— fail-closed",
                     [f"只能是 {' | '.join(LIVE_MODES)}"])
-    dry = ex.get("dry_run", True)
-    if dry:
+    if ex.get("dry_run", True) is not False:
         return Step(LIVE_AUTHORIZED, False, "enabled=true 但仍在 dry_run",
                     ["dry_run = false 才会真正提交订单"])
     return Step(LIVE_AUTHORIZED, True,
@@ -384,7 +401,9 @@ def evaluate() -> tuple[list[Step], str]:
 # ------------------------------------------------------------------ 写回命令
 def record_mcp(payload: dict) -> str:
     """校验并记录券商 MCP 只读验证结果。"""
-    missing = [k for k in MCP_CHECKS if not payload.get(k)]
+    # ★ 严格比 True:字符串 "false" 是非空字符串,truthiness 判定会当成通过。
+    # 对抗测试把九项全部提交为 "false",旧实现照样记"验证通过"。
+    missing = [k for k in MCP_CHECKS if payload.get(k) is not True]
     if missing:
         raise ConfigError(
             "只读验证未通过,以下项没有确认为 true:\n  "
@@ -405,7 +424,7 @@ def record_mcp(payload: dict) -> str:
 
     # 只读验证期间执行开关必须是关的,否则"只读"无从谈起
     ex = cfg.get("execution", {})
-    if ex.get("enabled") and not ex.get("dry_run"):
+    if ex.get("enabled") is True and ex.get("dry_run") is False:
         raise ConfigError(
             "验证期间 execution 处于真钱开启状态 —— 只读验证必须在 "
             "enabled=false 或 dry_run=true 下进行。"
@@ -433,7 +452,7 @@ def start_drill() -> str:
     """
     cfg = _read_profile()
     ex = cfg.get("execution", {})
-    if ex.get("enabled") and not ex.get("dry_run"):
+    if ex.get("enabled") is True and ex.get("dry_run") is False:
         raise ConfigError(
             "当前是真钱模式(enabled=true 且 dry_run=false)—— 演练必须在 dry_run 下进行。"
         )
@@ -445,11 +464,43 @@ def start_drill() -> str:
     state = _load_state()
     state["drill_active"] = {
         "run_id": run_id,
+        "nonce": secrets.token_hex(8),
         "started_at": now_et().strftime("%Y-%m-%d %H:%M ET"),
+        "started_ts": now_et().timestamp(),
         "account_fp": fp,
     }
+    state.pop("drill", None)      # 重开演练即作废上一次的结论
     _save_state(state)
     return run_id
+
+
+# 哪些环节能拿到**机器证据**,哪些只能靠 agent 自报 —— 必须写清楚,
+# 否则"演练通过"会被读成比它实际强的保证。
+MACHINE_VERIFIED_STAGES = ("preflight", "journal", "review")
+
+
+def append_drill_evidence(stage: str, detail: str = "") -> bool:
+    """由各阶段的脚本调用,为**当前 active run** 追加一行证据。
+
+    ★ 关键约束:run id 不由调用方指定,而是从 state 里读当前 active run。
+    旧实现让 preflight 写下订单里自带的任意 run id,于是不跑 `--start-drill`、
+    自造一个 id 就能凭空造出证据 —— 证据链的锚点被调用方控制了。
+    """
+    active = active_drill_run()
+    if not active.get("run_id"):
+        return False
+    rec = {
+        "run_id": active["run_id"],
+        "nonce": active.get("nonce", ""),
+        "account_fp": active.get("account_fp", ""),
+        "stage": stage,
+        "at": now_et().strftime("%Y-%m-%d %H:%M:%S ET"),
+        "detail": detail,
+    }
+    DRILL_LOG.parent.mkdir(parents=True, exist_ok=True)
+    with DRILL_LOG.open("a", encoding="utf-8") as fh:
+        fh.write(json.dumps(rec, ensure_ascii=False) + "\n")
+    return True
 
 
 def active_drill_run() -> dict:
@@ -469,8 +520,16 @@ def drill_evidence(run_id: str) -> list[dict]:
             rec = json.loads(line)
         except json.JSONDecodeError:
             continue
-        if rec.get("run_id") == run_id:
-            out.append(rec)
+        if rec.get("run_id") != run_id:
+            continue
+        # nonce 与账户指纹必须与当前 active run 一致 ——
+        # 光比 run id,一条旧的、或手写的证据行就够用了。
+        active = active_drill_run()
+        if active.get("nonce") and rec.get("nonce") != active["nonce"]:
+            continue
+        if active.get("account_fp") and rec.get("account_fp") != active["account_fp"]:
+            continue
+        out.append(rec)
     return out
 
 
@@ -490,12 +549,12 @@ def record_drill(payload: dict) -> str:
             raise ConfigError(f"演练的前置步骤未就绪 —— {step.state}: {step.detail}")
 
     ex = _read_profile().get("execution", {})
-    if ex.get("enabled") and not ex.get("dry_run"):
+    if ex.get("enabled") is True and ex.get("dry_run") is False:
         raise ConfigError(
             "当前处于真钱模式 —— 在 enabled=true 且 dry_run=false 下跑出来的不是演练。"
         )
 
-    missing = [k for k in DRILL_CHECKS if not payload.get(k)]
+    missing = [k for k in DRILL_CHECKS if payload.get(k) is not True]
     if missing:
         raise ConfigError(
             "演练未通过,以下环节没有确认为 true:\n  "
@@ -503,13 +562,15 @@ def record_drill(payload: dict) -> str:
         )
 
     active = active_drill_run()
-    run_id = str(payload.get("run_id", "") or active.get("run_id", "")).strip()
-    if not run_id:
+    if not active.get("run_id"):
+        # ★ 旧实现:active 不存在时,payload 里随便给个 id 就能进。
+        # 于是"从没开始过演练"和"演练做完了"无法区分。
         raise ConfigError(
-            "没有进行中的演练 —— 先跑 `python3 scripts/setup.py --start-drill` 拿到 run id,"
-            "再用它跑一遍 preflight。"
+            "没有进行中的演练 —— 先跑 `python3 scripts/setup.py --start-drill`,"
+            "再用它跑一遍完整流程。不能凭 payload 里自带的 run_id 记录结果。"
         )
-    if active.get("run_id") and run_id != active["run_id"]:
+    run_id = str(payload.get("run_id", "") or active["run_id"]).strip()
+    if run_id != active["run_id"]:
         raise ConfigError("提交的 run_id 与进行中的演练不一致")
 
     fp = current_account_fingerprint()
@@ -522,11 +583,23 @@ def record_drill(payload: dict) -> str:
             f"找不到 run {run_id} 的演练证据 —— preflight 没有以该 run id 跑过。\n"
             f"在订单 JSON 里加 \"drill_run_id\": \"{run_id}\" 再跑 preflight。"
         )
-    dry_runs = [e for e in ev if e.get("verdict") == "DRY_RUN"]
+    dry_runs = [e for e in ev if e.get("stage") == "preflight"
+                and e.get("verdict") == "DRY_RUN"]
     if not dry_runs:
         raise ConfigError(
-            f"run {run_id} 有 {len(ev)} 条证据,但没有一条判定为 DRY_RUN —— "
+            f"run {run_id} 有 {len(ev)} 条证据,但没有一条是判定为 DRY_RUN 的 preflight —— "
             f"演练要求走完闸门并停在模拟下单。"
+        )
+    stages = {e.get("stage") for e in ev}
+    lack = [s for s in MACHINE_VERIFIED_STAGES if s not in stages]
+    if lack:
+        raise ConfigError(
+            f"以下环节没有留下机器证据:{'、'.join(lack)}\n"
+            f"  preflight → 订单里带 drill_run_id 跑一遍\n"
+            f"  journal   → 跑 `make journal-check`\n"
+            f"  review    → 跑 `make stats`\n"
+            f"  (premarket / check 没有对应脚本,只能由你自报 —— "
+            f"这一点在记录里会如实标注。)"
         )
 
     state["drill"] = {
@@ -534,14 +607,17 @@ def record_drill(payload: dict) -> str:
         "at": now_et().strftime("%Y-%m-%d %H:%M ET"),
         "run_id": run_id,
         "account_fp": fp,
-        "evidence_count": len(dry_runs),
+        "evidence_count": len(ev),
+        "machine_verified": sorted(stages & set(MACHINE_VERIFIED_STAGES)),
+        "self_reported": ["premarket_ran", "check_ran"],
         "checks": {k: True for k in DRILL_CHECKS},
         "notes": str(payload.get("notes", "")),
     }
-    state.pop("drill_active", None)
+    state.pop("drill_active", None)        # 用完即销:同一个 run 不能记两次
     _save_state(state)
-    return (f"dry-run 演练已记录(run {run_id} · {len(dry_runs)} 条 preflight 证据 · "
-            f"{len(DRILL_CHECKS)} 个环节)")
+    return (f"dry-run 演练已记录(run {run_id} · {len(ev)} 条证据 · "
+            f"机器验证:{'、'.join(sorted(stages & set(MACHINE_VERIFIED_STAGES)))} · "
+            f"自报:premarket / check)")
 
 
 def _set_execution_key(text: str, key: str, literal: str) -> str:
@@ -623,7 +699,9 @@ def authorize_live(mode: str) -> str:
 
     return (
         f"真钱执行已开启 · live_mode = {mode}(已回读校验)\n"
-        f"  仍然无条件生效:单笔/单日金额上限、单日笔数、kill switch\n"
+        f"  仍然生效:kill switch 与账户身份(买卖都无条件)、\n"
+        f"           单笔/单日金额上限与笔数(买入无条件;卖出与 intent=close 的清仓有豁免,\n"
+        f"           但需提供持仓数据)\n"
         f"  想立刻全停:touch data/HALTED"
     )
 

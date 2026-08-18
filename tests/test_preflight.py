@@ -287,7 +287,8 @@ class TestSize(unittest.TestCase):
 
     def test_zero_amount_denies(self):
         r = run(order(amount_usd=0.0), cfg(), NOON, vocab=TEST_VOCAB)
-        self.assertIn("金额为正", names_failed(r))
+        # 金额 <= 0 现在在结构校验层就被挡下,不必等到金额闸门
+        self.assertIn("订单结构", names_failed(r))
 
     def test_amount_derived_from_qty_and_price(self):
         o = order()
@@ -396,275 +397,6 @@ class TestRefId(unittest.TestCase):
         self.assertIn("不是完备保证", check.hint)
 
 
-class TestInputValidation(unittest.TestCase):
-    def test_missing_required_fields(self):
-        errs = validate_order({"side": "buy", "amount_usd": 10})
-        self.assertTrue(any("symbol" in e for e in errs))
-        self.assertTrue(any("reason_tag" in e for e in errs))
-
-    def test_bad_side(self):
-        errs = validate_order({"symbol": "X", "side": "hold",
-                               "reason_tag": "建仓", "amount_usd": 1})
-        self.assertTrue(any("side" in e for e in errs))
-
-    def test_no_amount_or_qty(self):
-        errs = validate_order({"symbol": "X", "side": "buy", "reason_tag": "建仓"})
-        self.assertTrue(any("amount_usd 或 qty" in e for e in errs))
-
-    def test_clean_order_validates(self):
-        self.assertEqual(validate_order(BASE_ORDER), [])
-
-    def test_example_order_is_valid(self):
-        self.assertEqual(validate_order(preflight.EXAMPLE_ORDER), [])
-
-
-class TestCli(unittest.TestCase):
-    """CLI 入口测试 —— run() 通过不代表命令行可用。"""
-
-    def _main(self, argv):
-        import contextlib
-        import io
-
-        buf = io.StringIO()
-        with contextlib.redirect_stdout(buf):
-            code = preflight.main(argv)
-        return code, buf.getvalue()
-
-    def test_example_flag_works_alone(self):
-        """--example 不需要输入源 —— 曾因放进 required 互斥组而无法单独使用。"""
-        code, out = self._main(["--example"])
-        self.assertEqual(code, 0)
-        self.assertIn("reason_tag", out)
-        import json as _json
-
-        self.assertEqual(validate_order(_json.loads(out)), [])
-
-    def test_missing_input_source_errors(self):
-        with self.assertRaises(SystemExit):
-            preflight.main([])
-
-    def test_order_file_json_output(self):
-        import json as _json
-        import tempfile
-
-        with tempfile.NamedTemporaryFile("w", suffix=".json", delete=False,
-                                         encoding="utf-8") as fh:
-            _json.dump(BASE_ORDER, fh)
-            path = fh.name
-        code, out = self._main(["--order-file", path, "--json",
-                                "--now-et", "2026-08-18 13:00"])
-        payload = _json.loads(out)
-        self.assertIn(payload["verdict"], (ALLOW, DRY_RUN, DENY))
-        self.assertIn("checks", payload)
-
-    def test_deny_exits_nonzero(self):
-        import json as _json
-        import tempfile
-
-        bad = dict(BASE_ORDER, analysis_at_et="2026-08-18 08:00")
-        with tempfile.NamedTemporaryFile("w", suffix=".json", delete=False,
-                                         encoding="utf-8") as fh:
-            _json.dump(bad, fh)
-            path = fh.name
-        code, _ = self._main(["--order-file", path, "--now-et", "2026-08-18 13:00"])
-        self.assertEqual(code, 1)
-
-    def test_malformed_json_exits_two(self):
-        import tempfile
-
-        with tempfile.NamedTemporaryFile("w", suffix=".json", delete=False,
-                                         encoding="utf-8") as fh:
-            fh.write("{not json")
-            path = fh.name
-        code = preflight.main(["--order-file", path])
-        self.assertEqual(code, 2)
-
-
-class TestMultipleBlockers(unittest.TestCase):
-    def test_all_blockers_reported_not_just_first(self):
-        """一次跑完所有闸门,不要 fail-fast —— 用户需要一次看到全部问题。"""
-        r = run(
-            order(
-                amount_usd=500.0,
-                analysis_at_et="2026-08-18 08:00",
-                quote_timestamp_et="2026-08-18 08:00",
-                reason_tag="瞎卖",
-                ref_id="bad",
-            ),
-            cfg(execution={"enabled": False}),
-            NOON,
-        )
-        self.assertEqual(r.verdict, DENY)
-        self.assertGreaterEqual(len(r.blockers), 5)
-
-
-class TestSetupGate(unittest.TestCase):
-    """★ 状态机必须真的接在下单路径上,而不是只做提示。
-
-    对抗测试原文:构造 setup 未完成、订单本身合法的场景,preflight 仍返回 ALLOW。
-    """
-
-    def _incomplete(self):
-        steps, _ = all_steps_ok()
-        steps[1].ok, steps[1].detail = False, "尚未完成券商 MCP 只读验证"
-        steps[4].ok, steps[4].detail = False, "尚未完成 dry-run 演练"
-        return steps, "UNINITIALIZED"
-
-    def test_live_order_denied_when_setup_incomplete(self):
-        preflight._setup_evaluate = self._incomplete
-        self.addCleanup(lambda: setattr(preflight, "_setup_evaluate", all_steps_ok))
-        r = run(order(), cfg(), NOON, vocab=TEST_VOCAB)
-        self.assertEqual(r.verdict, DENY)
-        self.assertIn("接入状态", names_failed(r))
-
-    def test_dry_run_is_not_blocked_by_setup(self):
-        """演练本身就是第 5 步 —— 要求它先完成第 5 步是死循环。"""
-        preflight._setup_evaluate = self._incomplete
-        self.addCleanup(lambda: setattr(preflight, "_setup_evaluate", all_steps_ok))
-        c = cfg()
-        c["execution"]["dry_run"] = True
-        r = run(order(), c, NOON, vocab=TEST_VOCAB)
-        self.assertEqual(r.verdict, DRY_RUN)
-
-    def test_unreadable_setup_state_fails_closed(self):
-        def boom():
-            raise RuntimeError("state unreadable")
-
-        preflight._setup_evaluate = boom
-        self.addCleanup(lambda: setattr(preflight, "_setup_evaluate", all_steps_ok))
-        r = run(order(), cfg(), NOON, vocab=TEST_VOCAB)
-        self.assertEqual(r.verdict, DENY)
-
-
-class TestConfigValidityGate(unittest.TestCase):
-    def test_invalid_live_mode_is_denied_not_treated_as_autonomous(self):
-        """对抗测试原文:live_mode="invalid" 会落进宽松分支拿到 ×1.0。"""
-        c = cfg()
-        c["execution"]["live_mode"] = "invalid"
-        r = run(order(), c, NOON, vocab=TEST_VOCAB)
-        self.assertEqual(r.verdict, DENY)
-        self.assertIn("配置合法性", names_failed(r))
-
-    def test_unknown_live_mode_does_not_widen_size(self):
-        """第二道:即便配置闸门被绕过,尺寸也按最严档,不按 autonomous。"""
-        ex = {"size_scale_observe": 0.4, "size_scale_supported": 1.0,
-              "max_order_usd": 100, "live_mode": "invalid"}
-
-        class R:
-            id, kind, status, scope = "r1", "market", "supported", "live"
-
-        scale, _ = preflight.rule_size_tier(R(), ex)
-        self.assertEqual(scale, 1.0)
-        mode = str(ex.get("live_mode", "guarded"))
-        self.assertNotEqual(mode, "autonomous")
-
-    def test_negative_cap_is_denied(self):
-        c = cfg()
-        c["execution"]["max_order_usd"] = -1
-        r = run(order(), c, NOON, vocab=TEST_VOCAB)
-        self.assertIn("配置合法性", names_failed(r))
-
-
-class TestEmergencyExit(unittest.TestCase):
-    """★ 风控不能变成"进得去出不来"。"""
-
-    def _closing(self, **over):
-        o = order(intent="close", amount_usd=120.0, reason_tag="清仓", **over)
-        return o
-
-    def test_liquidation_allowed_after_same_symbol_traded_today(self):
-        """对抗测试原文:同一股票当天交易过后,紧急清仓仍被"重复交易"拦截。"""
-        o = self._closing(today_orders=[{"symbol": "AAAA", "side": "buy", "amount": 50}])
-        r = run(o, cfg(), NOON, vocab=TEST_VOCAB)
-        self.assertEqual(r.verdict, ALLOW, [c.detail for c in r.blockers])
-
-    def test_liquidation_allowed_after_daily_order_count_reached(self):
-        """对抗测试原文:达到每日订单数上限后,紧急清仓仍被拦截。"""
-        today = [{"symbol": f"S{i}", "side": "buy", "amount": 10} for i in range(6)]
-        r = run(self._closing(today_orders=today), cfg(), NOON, vocab=TEST_VOCAB)
-        self.assertEqual(r.verdict, ALLOW, [c.detail for c in r.blockers])
-
-    def test_normal_sell_still_blocked_by_daily_count(self):
-        """豁免只属于 intent=close —— 普通减仓不该顺带获得豁免。"""
-        today = [{"symbol": f"S{i}", "side": "buy", "amount": 10} for i in range(6)]
-        r = run(order(today_orders=today), cfg(), NOON, vocab=TEST_VOCAB)
-        self.assertEqual(r.verdict, DENY)
-        self.assertIn("单日笔数", names_failed(r))
-
-    def test_liquidation_without_position_evidence_is_denied(self):
-        """否则任何单子都能自称清仓来绕开上限。"""
-        o = self._closing(today_orders=[{"symbol": "AAAA", "side": "buy", "amount": 50}])
-        del o["position"]
-        r = run(o, cfg(), NOON, vocab=TEST_VOCAB)
-        self.assertEqual(r.verdict, DENY)
-        self.assertIn("清仓证据", names_failed(r))
-
-    def test_liquidation_still_bound_by_account_identity(self):
-        o = self._closing()
-        o["account_id"] = "555000222"          # privacy-allow
-        r = run(o, cfg(), NOON, vocab=TEST_VOCAB)
-        self.assertEqual(r.verdict, DENY)
-        self.assertIn("账户身份", names_failed(r))
-
-
-class TestShareCount(unittest.TestCase):
-    def test_selling_more_shares_than_held_is_denied(self):
-        """对抗测试原文:持有 1 股却卖出 2 股,在部分金额条件下仍可能 ALLOW。"""
-        o = order(qty=2, price=10.0, amount_usd=None, intent="close",
-                  reason_tag="清仓",
-                  position={"market_value": 100.0, "qty": 1, "avg_cost": 10.0})
-        r = run(o, cfg(), NOON, vocab=TEST_VOCAB)
-        self.assertEqual(r.verdict, DENY)
-        self.assertIn("持仓股数", names_failed(r))
-
-    def test_selling_exactly_held_shares_is_fine(self):
-        o = order(qty=1, price=10.0, amount_usd=None, intent="close",
-                  reason_tag="清仓",
-                  position={"market_value": 10.0, "qty": 1, "avg_cost": 10.0})
-        r = run(o, cfg(), NOON, vocab=TEST_VOCAB)
-        self.assertNotIn("持仓股数", names_failed(r))
-
-
-class TestFailClosedOnMissingData(unittest.TestCase):
-    def test_buy_without_buying_power_is_denied(self):
-        """对抗测试原文:买单缺失 portfolio/BP 数据时可能 fail-open。"""
-        o = order(side="buy", reason_tag="建仓", amount_usd=30.0,
-                  primary_rule_id=None)
-        o.pop("portfolio", None)
-        o.pop("primary_rule_id", None)
-        r = run(o, cfg(), NOON, vocab=TEST_VOCAB)
-        self.assertEqual(r.verdict, DENY)
-        self.assertIn("买力充足", names_failed(r))
-
-    def test_broken_ledger_denies_instead_of_passing_silently(self):
-        """对抗测试原文:台账损坏时 LedgerError 被吞掉,订单可能继续放行。"""
-        def boom():
-            from meigu_lib import LedgerError
-
-            raise LedgerError("台账第 3 行列数不对")
-
-        saved = preflight.parse_trades
-        preflight.parse_trades = boom
-        self.addCleanup(lambda: setattr(preflight, "parse_trades", saved))
-        r = run(order(), cfg(), NOON, vocab=TEST_VOCAB)
-        self.assertEqual(r.verdict, DENY)
-        self.assertIn("台账可读", names_failed(r))
-
-
-class TestRuleIdContract(unittest.TestCase):
-    def test_legacy_rule_ids_field_is_rejected_loudly(self):
-        """对抗测试原文:文档要求写 rule_ids,代码只认 primary_rule_id,
-        结果是静默降到 40% 尺寸 —— 静默降档比报错难查得多。"""
-        o = order(side="buy", reason_tag="建仓", amount_usd=20.0,
-                  rule_ids=["cash-deployment"])
-        o.pop("primary_rule_id", None)
-        r = run(o, cfg(), NOON, vocab=TEST_VOCAB)
-        self.assertEqual(r.verdict, DENY)
-        self.assertIn("证据尺寸", names_failed(r))
-
-
-if __name__ == "__main__":
-    unittest.main()
 
 
 class TestEvidenceSizing(unittest.TestCase):
@@ -868,7 +600,8 @@ class TestConfigValidityGate(unittest.TestCase):
         c = cfg()
         c["execution"]["max_order_usd"] = -1
         r = run(order(), c, NOON, vocab=TEST_VOCAB)
-        self.assertIn("配置合法性", names_failed(r))
+        self.assertEqual(r.verdict, DENY)
+        self.assertTrue({"配置结构", "配置合法性"} & names_failed(r))
 
 
 class TestEmergencyExit(unittest.TestCase):
@@ -940,7 +673,7 @@ class TestFailClosedOnMissingData(unittest.TestCase):
         o.pop("primary_rule_id", None)
         r = run(o, cfg(), NOON, vocab=TEST_VOCAB)
         self.assertEqual(r.verdict, DENY)
-        self.assertIn("买力充足", names_failed(r))
+        self.assertIn("风控数据完整性", names_failed(r))
 
     def test_broken_ledger_denies_instead_of_passing_silently(self):
         """对抗测试原文:台账损坏时 LedgerError 被吞掉,订单可能继续放行。"""
@@ -967,6 +700,127 @@ class TestRuleIdContract(unittest.TestCase):
         r = run(o, cfg(), NOON, vocab=TEST_VOCAB)
         self.assertEqual(r.verdict, DENY)
         self.assertIn("证据尺寸", names_failed(r))
+
+
+class TestSizeFieldConflict(unittest.TestCase):
+    """★ 本轮最严重的绕过:两套尺寸口径不一致时,所有金额上限一次全废。"""
+
+    def test_amount_usd_cannot_understate_qty_times_price(self):
+        """对抗测试原文:amount_usd=1 而 qty×price=10000,判定 ALLOW。"""
+        r = run(order(amount_usd=1, qty=100, price=100, intent="close",
+                      reason_tag="清仓", position={"market_value": 10000.0, "qty": 100}),
+                cfg(), NOON, vocab=TEST_VOCAB)
+        self.assertEqual(r.verdict, DENY)
+        self.assertIn("订单结构", names_failed(r))
+
+    def test_consistent_two_field_order_is_fine(self):
+        o = order(amount_usd=30.0, qty=3, price=10.0,
+                  position={"market_value": 120.0, "qty": 12})
+        r = run(o, cfg(), NOON, vocab=TEST_VOCAB)
+        self.assertEqual(r.verdict, ALLOW, [c.detail for c in r.blockers])
+
+    def test_amount_uses_the_larger_of_the_two(self):
+        """即便校验被绕过,金额也按更严的口径算。"""
+        self.assertEqual(preflight._order_amount({"amount_usd": 1, "qty": 100, "price": 100}),
+                         10000.0)
+
+
+class TestRiskDataCompleteness(unittest.TestCase):
+    """★ 缺字段不是"这道闸门不适用",而是"这道闸门没跑"。"""
+
+    def _buy(self, **kw):
+        o = order(side="buy", reason_tag="建仓", intent="", amount_usd=20.0, **kw)
+        o.pop("primary_rule_id", None)
+        return o
+
+    def test_buy_missing_total_and_equity_is_denied(self):
+        """对抗测试原文:只给 buying_power 就跳过集中度与现金底线。"""
+        o = self._buy(portfolio={"buying_power": 90.0})
+        o["portfolio"] = {"buying_power": 90.0}
+        o.pop("position", None)
+        r = run(o, cfg(), NOON, vocab=TEST_VOCAB)
+        self.assertEqual(r.verdict, DENY)
+        self.assertIn("风控数据完整性", names_failed(r))
+
+    def test_missing_today_orders_is_denied(self):
+        """缺 today_orders 会把当日累计、笔数、同标的重复一起清零。"""
+        o = order()
+        del o["today_orders"]
+        r = run(o, cfg(), NOON, vocab=TEST_VOCAB)
+        self.assertEqual(r.verdict, DENY)
+        self.assertIn("订单结构", names_failed(r))
+
+    def test_negative_today_order_amount_is_denied(self):
+        """负数金额可以抵消已用额度。"""
+        r = run(order(today_orders=[{"symbol": "B", "side": "buy", "amount": -5000}]),
+                cfg(), NOON, vocab=TEST_VOCAB)
+        self.assertEqual(r.verdict, DENY)
+        self.assertIn("订单结构", names_failed(r))
+
+
+class TestStrictBooleans(unittest.TestCase):
+    def test_string_false_does_not_enable_execution(self):
+        """★ 非空字符串在 Python 里为真 —— 配置里一个引号就能让总开关常开。"""
+        c = cfg()
+        c["execution"]["enabled"] = "false"
+        r = run(order(), c, NOON, vocab=TEST_VOCAB)
+        self.assertEqual(r.verdict, DENY)
+        self.assertIn("配置结构", names_failed(r))
+
+    def test_string_false_dry_run_does_not_become_live(self):
+        c = cfg()
+        c["execution"]["dry_run"] = "false"
+        r = run(order(), c, NOON, vocab=TEST_VOCAB)
+        self.assertEqual(r.verdict, DENY)
+
+
+class TestNoTracebacksOnBadInput(unittest.TestCase):
+    """★ 崩溃不等于拒绝:traceback 容易被当成偶发故障重试。"""
+
+    def test_bad_inputs_all_produce_structured_deny(self):
+        cases = {
+            "amount_usd 非数字": (dict(amount_usd="oops"), {}),
+            "qty 为负": (dict(qty=-5, amount_usd=10.0), {}),
+            "qty 为 NaN": (dict(qty=float("nan"), price=1.0, amount_usd=None), {}),
+            "today_orders 是字符串": (dict(today_orders="oops"), {}),
+            "position 是字符串": (dict(position="oops"), {}),
+            "order_type 非法": (dict(order_type="anything"), {}),
+            "market_hours 非法": (dict(market_hours="anything"), {}),
+            "intent 非法": (dict(intent="whatever"), {}),
+            "max_order_usd 非数字": ({}, dict(max_order_usd="oops")),
+            "kill_switch 指向仓外": ({}, dict(kill_switch_file="/tmp")),
+            "max_orders_per_day 非整数": ({}, dict(max_orders_per_day="six")),
+        }
+        for name, (omut, cmut) in cases.items():
+            with self.subTest(case=name):
+                c = cfg()
+                c["execution"].update(cmut)
+                r = run(order(**omut), c, NOON, vocab=TEST_VOCAB)   # 不得抛异常
+                self.assertEqual(r.verdict, DENY, name)
+
+
+class TestExitQuantityEvidence(unittest.TestCase):
+    def test_share_sell_without_position_qty_is_denied(self):
+        """对抗测试原文:只给 market_value 不给 qty,卖 100 股仍 ALLOW。"""
+        o = order(intent="close", reason_tag="清仓", qty=100, price=1.2,
+                  amount_usd=120.0, position={"market_value": 120.0})
+        r = run(o, cfg(), NOON, vocab=TEST_VOCAB)
+        self.assertEqual(r.verdict, DENY)
+        self.assertIn("持仓股数", names_failed(r))
+
+    def test_close_intent_must_actually_close(self):
+        """声明清仓却只卖一小部分 = 用清仓通道换取笔数豁免。"""
+        o = order(intent="close", reason_tag="清仓", qty=1, price=10.0, amount_usd=10.0,
+                  position={"market_value": 100.0, "qty": 10})
+        r = run(o, cfg(), NOON, vocab=TEST_VOCAB)
+        self.assertEqual(r.verdict, DENY)
+        self.assertIn("清仓数量吻合", names_failed(r))
+
+    def test_genuine_full_close_passes(self):
+        o = order(intent="close", reason_tag="清仓", qty=10, price=10.0, amount_usd=100.0,
+                  position={"market_value": 100.0, "qty": 10})
+        r = run(o, cfg(), NOON, vocab=TEST_VOCAB)
+        self.assertEqual(r.verdict, ALLOW, [c.detail for c in r.blockers])
 
 
 if __name__ == "__main__":

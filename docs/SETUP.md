@@ -85,7 +85,7 @@ id = "刚刚验证过的下单子账户号"   # 主账户只读,不填这里
 display_last4 = "后4位"          # 汇报和日报里只露这个
 type = "cash"                    # cash 的卖出资金 T+1 结算,会影响当日可用买力
 
-[execution]                      # 四条硬上限:不随证据强度变化,任何规则都绕不过
+[execution]                      # 四条硬上限:任何规则都绕不过(买卖口径见 README 的表)
 max_order_usd = 80               # 单笔
 max_daily_usd = 200              # 单日**买入**累计(卖出不受此限)
 max_orders_per_day = 6
@@ -123,7 +123,7 @@ make rules-check     # 格式、标签引用、闸门引用
 
 ```bash
 make doctor          # 应该只剩防休眠类的提醒
-make test            # 339 个测试应全绿
+make test            # 357 个测试应全绿
 make trading-day     # 今天是不是交易日
 make report          # 生成 reports/{今天}.md 骨架
 ```

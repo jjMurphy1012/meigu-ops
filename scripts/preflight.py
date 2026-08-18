@@ -58,6 +58,8 @@ ALLOW, DRY_RUN, DENY = "ALLOW", "DRY_RUN", "DENY"
 # 闸门注册表 —— config/rules.toml 的 `enforced_by` 只能引用这里的名字。
 # 写错闸门名会让规则显示「程序强制」但其实无人把守,所以 rules.py 会交叉校验。
 GATE_NAMES = (
+    "订单结构",
+    "配置结构",
     "紧急停止开关",
     "下单授权",
     "接入状态",
@@ -80,6 +82,8 @@ GATE_NAMES = (
     "同标的当日重复",
     "持仓股数",
     "清仓证据",
+    "清仓数量吻合",
+    "风控数据完整性",
     "台账可读",
     "ref_id",
 )
@@ -114,6 +118,43 @@ class Result:
 # --------------------------------------------------------------------- 输入解析
 REQUIRED_FIELDS = ("symbol", "side", "reason_tag")
 
+VALID_ORDER_TYPES = ("market", "limit")
+VALID_MARKET_HOURS = ("regular_hours", "extended_hours", "all_day_hours")
+VALID_INTENTS = ("", "partial", "close", "open", "add")
+
+# 金额口径不一致的容忍度。券商成交价与报价之间本就有滑点,
+# 但 amount_usd 与 qty×price 差出一个数量级只可能是错误或绕过。
+AMOUNT_RECONCILE_TOL = 0.05          # 5%
+
+
+def _num(value, field: str, errs: list[str], *,
+         positive: bool = True, allow_none: bool = True) -> float | None:
+    """把一个字段解析成有限数,失败就记错误 —— 不抛异常。
+
+    ★ 为什么不用 float() 直接转:`float("oops")` 抛 ValueError,
+    而闸门跑到一半抛异常的结果是 **traceback 而不是 DENY**。
+    调用方看到的是崩溃,不是"这单不许下" —— 前者容易被当成偶发故障重试。
+    bool 也要挡:Python 里 `True` 是数字 1,`enabled = True` 当金额用不会报错。
+    """
+    if value is None:
+        if not allow_none:
+            errs.append(f"{field} 缺失")
+        return None
+    if isinstance(value, bool):
+        errs.append(f"{field} 是布尔值,不是数字:{value!r}")
+        return None
+    if not isinstance(value, (int, float)):
+        errs.append(f"{field} 必须是数字,实际 {type(value).__name__}:{value!r}")
+        return None
+    f = float(value)
+    if f != f or f in (float("inf"), float("-inf")):
+        errs.append(f"{field} 不是有限数:{value!r}")
+        return None
+    if positive and f <= 0:
+        errs.append(f"{field} 必须 > 0,实际 {f}")
+        return None
+    return f
+
 
 def _parse_et(value: str | None, field_name: str) -> dt.datetime | None:
     """解析 ET 时间戳。接受 ISO 或 'YYYY-MM-DD HH:MM[:SS]'。"""
@@ -121,7 +162,7 @@ def _parse_et(value: str | None, field_name: str) -> dt.datetime | None:
         return None
     from zoneinfo import ZoneInfo
 
-    text = value.strip().replace("T", " ")
+    text = str(value).strip().replace("T", " ")
     for fmt in ("%Y-%m-%d %H:%M:%S", "%Y-%m-%d %H:%M"):
         try:
             naive = dt.datetime.strptime(text[: len(fmt) + 2].strip(), fmt)
@@ -132,19 +173,118 @@ def _parse_et(value: str | None, field_name: str) -> dt.datetime | None:
 
 
 def validate_order(order: dict) -> list[str]:
-    errs = [f"缺少必填字段 {f}" for f in REQUIRED_FIELDS if not order.get(f)]
+    """订单结构与取值的完整校验。
+
+    这一层的存在理由:后面每一道闸门都假设字段是"能算的数"。假设一旦不成立,
+    闸门不是拦住订单,而是**崩掉**;而崩溃在自动化链路里等于"这次没检查"。
+    """
+    errs: list[str] = []
+    if not isinstance(order, dict):
+        return ["订单必须是 JSON 对象"]
+
+    errs += [f"缺少必填字段 {f}" for f in REQUIRED_FIELDS if not order.get(f)]
+
     side = str(order.get("side", "")).lower()
     if side not in ("buy", "sell"):
         errs.append(f"side 必须是 buy 或 sell,实际 {order.get('side')!r}")
-    if order.get("amount_usd") is None and order.get("qty") is None:
+
+    order_type = str(order.get("order_type", "market")).lower()
+    if order_type not in VALID_ORDER_TYPES:
+        errs.append(f"order_type 必须是 {'/'.join(VALID_ORDER_TYPES)},实际 {order_type!r}")
+    session = str(order.get("market_hours", "regular_hours")).lower()
+    if session not in VALID_MARKET_HOURS:
+        errs.append(f"market_hours 必须是 {'/'.join(VALID_MARKET_HOURS)},实际 {session!r}")
+    intent = str(order.get("intent", "")).lower()
+    if intent not in VALID_INTENTS:
+        errs.append(f"intent 必须是 {'/'.join(x or '(空)' for x in VALID_INTENTS)},实际 {intent!r}")
+
+    amt = _num(order.get("amount_usd"), "amount_usd", errs)
+    qty = _num(order.get("qty"), "qty", errs)
+    price = _num(order.get("price"), "price", errs)
+    if amt is None and qty is None:
         errs.append("必须提供 amount_usd 或 qty 之一")
+
+    # ★ 两套尺寸口径必须自洽。
+    # 旧实现:只要有 amount_usd 就忽略 qty×price —— 于是
+    # {"amount_usd": 1, "qty": 100, "price": 100} 会按 $1 过闸门、按 100 股成交。
+    # 这是最严重的绕过路径:所有金额上限一次全废。
+    if amt is not None and qty is not None and price is not None:
+        implied = qty * price
+        if implied > 0 and abs(implied - amt) / implied > AMOUNT_RECONCILE_TOL:
+            errs.append(
+                f"金额口径不一致:amount_usd=${amt:.2f} 但 qty×price=${implied:.2f}"
+                f"(容差 {AMOUNT_RECONCILE_TOL:.0%})—— 两者必须描述同一笔单"
+            )
+
+    for key in ("position", "portfolio"):
+        v = order.get(key)
+        if v is not None and not isinstance(v, dict):
+            errs.append(f"{key} 必须是对象,实际 {type(v).__name__}")
+
+    td = order.get("today_orders")
+    if td is None:
+        # 缺失不能当成"今天还没下过单" —— 那会把当日累计、笔数、同标的重复
+        # 三道闸门一起清零。不知道就是不知道,必须显式给 []。
+        errs.append("today_orders 缺失 —— 今日已下单情况未知时不得放行(没有就显式给 [])")
+    elif not isinstance(td, list):
+        errs.append(f"today_orders 必须是数组,实际 {type(td).__name__}")
+    else:
+        for i, o in enumerate(td):
+            if not isinstance(o, dict):
+                errs.append(f"today_orders[{i}] 必须是对象")
+                continue
+            a = o.get("amount", o.get("amount_usd"))
+            if a is not None:
+                _num(a, f"today_orders[{i}].amount", errs)
+
+    for key in ("position.market_value", "position.qty", "position.avg_cost"):
+        head, tail = key.split(".")
+        src = order.get(head)
+        if isinstance(src, dict) and tail in src:
+            _num(src[tail], key, errs, positive=(tail != "avg_cost"))
+    pf = order.get("portfolio")
+    if isinstance(pf, dict):
+        for k in ("buying_power", "total_value", "equity_value", "cash"):
+            if k in pf:
+                _num(pf[k], f"portfolio.{k}", errs, positive=False)
+    return errs
+
+
+def validate_config(cfg: dict) -> list[str]:
+    """执行配置的类型校验 —— 在跑任何数值闸门之前。
+
+    ★ `enabled = "false"` 这种写法在 Python 里是**真**(非空字符串)。
+    配置文件里一个多余的引号就能把总开关变成常开,而且没有任何提示。
+    """
+    errs: list[str] = []
+    ex = cfg.get("execution", {})
+    if not isinstance(ex, dict):
+        return ["execution 必须是对象"]
+
+    for k in ("enabled", "dry_run", "require_confirmation"):
+        if k in ex and not isinstance(ex[k], bool):
+            errs.append(
+                f"execution.{k} 必须是**原生布尔值** true/false,"
+                f"实际 {type(ex[k]).__name__}:{ex[k]!r} —— "
+                f"带引号的 \"false\" 会被当成真"
+            )
+    for k in ("max_order_usd", "max_daily_usd", "intent_ttl_minutes",
+              "quote_max_age_minutes", "size_scale_observe",
+              "size_scale_weak", "size_scale_supported"):
+        if k in ex:
+            _num(ex[k], f"execution.{k}", errs)
+    if "max_orders_per_day" in ex and (
+        not isinstance(ex["max_orders_per_day"], int)
+        or isinstance(ex["max_orders_per_day"], bool)
+    ):
+        errs.append(f"execution.max_orders_per_day 必须是整数,实际 {ex['max_orders_per_day']!r}")
     return errs
 
 
 def is_live(cfg: dict) -> bool:
     """这一单会真的提交到券商吗?"""
     ex = cfg.get("execution", {})
-    return bool(ex.get("enabled")) and not bool(ex.get("dry_run", True))
+    return ex.get("enabled") is True and ex.get("dry_run", True) is False
 
 
 def is_emergency_exit(order: dict) -> bool:
@@ -212,19 +352,27 @@ def check_config_valid(r: Result, cfg: dict) -> None:
 
 
 def check_kill_switch(r: Result, cfg: dict) -> None:
-    path = ROOT / cfg.get("execution", {}).get("kill_switch_file", "data/HALTED")
+    raw = cfg.get("execution", {}).get("kill_switch_file", "data/HALTED")
+    try:
+        path = ROOT / str(raw)
+        rel = path.relative_to(ROOT)
+    except (ValueError, TypeError):
+        # 指向仓外或类型不对 —— 那这个"急停开关"永远按不下去。
+        r.add("紧急停止开关", False, f"kill_switch_file 非法:{raw!r}",
+              hint="必须是仓库内的相对路径,否则急停开关形同虚设。")
+        return
     exists = path.exists()
     r.add(
         "紧急停止开关",
         not exists,
-        f"{path.relative_to(ROOT)} 存在 —— 一切下单已禁止" if exists else "未触发",
-        hint=f"确认要恢复交易再删除 {path.relative_to(ROOT)}。" if exists else "",
+        f"{rel} 存在 —— 一切下单已禁止" if exists else "未触发",
+        hint=f"确认要恢复交易再删除 {rel}。" if exists else "",
     )
 
 
 def check_execution_enabled(r: Result, cfg: dict) -> None:
     ex = cfg.get("execution", {})
-    enabled = bool(ex.get("enabled", False))
+    enabled = ex.get("enabled", False) is True      # 严格比 True,不用 truthiness
     r.add(
         "下单授权",
         enabled,
@@ -370,13 +518,19 @@ def check_quote_timestamp(r: Result, cfg: dict, order: dict, now: dt.datetime) -
 
 
 def _order_amount(order: dict) -> float | None:
-    amt = order.get("amount_usd")
-    if amt is not None:
-        return float(amt)
-    qty, price = order.get("qty"), order.get("price")
-    if qty is not None and price is not None:
-        return float(qty) * float(price)
-    return None
+    """本笔的美元口径。
+
+    两种口径都给出时取**较大者**:schema 校验已保证二者相差不超过容差,
+    所以这里的 max 不是"选一个",而是"万一校验被绕过时倾向更严"。
+    旧实现无条件优先 amount_usd —— 那正是 $1 报价、100 股成交的绕过路径。
+    """
+    errs: list[str] = []
+    amt = _num(order.get("amount_usd"), "amount_usd", errs)
+    qty = _num(order.get("qty"), "qty", errs)
+    price = _num(order.get("price"), "price", errs)
+    implied = qty * price if (qty is not None and price is not None) else None
+    vals = [v for v in (amt, implied) if v is not None]
+    return max(vals) if vals else None
 
 
 def check_size(r: Result, cfg: dict, order: dict) -> None:
@@ -415,12 +569,27 @@ def check_size(r: Result, cfg: dict, order: dict) -> None:
     if side == "sell":
         held = (order.get("position") or {}).get("qty")
         want = order.get("qty")
-        if held is not None and want is not None:
+        if want is not None and held is None:
+            # ★ 旧实现:两边都有 qty 才比。于是"报了股数、不报持仓"直接免检 ——
+            # 缺字段又一次变成免检通道。
+            r.add("持仓股数", False,
+                  f"按股数下卖单({want})但未提供 position.qty —— 无法确认是否超卖",
+                  hint="用 get_equity_positions 读到的实际股数填进 position.qty。")
+        elif held is not None and want is not None:
             held_f, want_f = float(held), float(want)
             r.add("持仓股数", want_f <= held_f + 1e-9,
                   f"拟卖 {want_f:g} 股 / 实际持有 {held_f:g} 股",
                   hint="卖出股数超过持仓 —— 现金账户会直接拒单或形成裸空。"
                   if want_f > held_f else "")
+            if str(order.get("intent", "")).lower() == "close":
+                # 清仓声明的是"全部出清"。差得远说明要么意图写错、要么股数算错,
+                # 而 intent=close 会豁免笔数与同标的重复 —— 不能让它名不副实。
+                close_ok = want_f >= held_f * 0.995
+                r.add("清仓数量吻合", close_ok,
+                      f"intent=close:拟卖 {want_f:g} / 持有 {held_f:g}",
+                      hint="声明清仓却只卖一部分 —— 改成 intent=partial,"
+                           "否则等于用清仓通道换取笔数豁免。"
+                      if not close_ok else "")
 
     if is_emergency_exit(order):
         pos = order.get("position") or {}
@@ -477,16 +646,24 @@ def check_concentration_and_bp(r: Result, cfg: dict, order: dict) -> None:
     equity = pf.get("equity_value")
     total = pf.get("total_value")
 
-    if bp is None:
-        # ★ 曾经是"没数据就跳过这道闸门" —— 那等于把最容易缺的字段变成免检通道。
-        # 买入是新增风险,买力未知时不能假设够用。
-        r.add(
-            "买力充足",
-            False,
-            "订单未提供 portfolio.buying_power —— 无法确认买力是否足够",
-            hint="买单必须带上 get_portfolio 读到的 buying_power。缺数据一律 fail-closed。",
-        )
-    else:
+    # ★ 缺字段不是"这道闸门不适用",而是"这道闸门没跑"。
+    # 旧实现对 equity/total/position 是 if-not-None 才检查,于是只要少给两个字段,
+    # 集中度与现金底线就自动免检 —— 而它们恰恰是买入端最容易出事的两道。
+    missing = [name for name, v in (
+        ("portfolio.buying_power", bp),
+        ("portfolio.total_value", total),
+        ("portfolio.equity_value", equity),
+        ("position.market_value", position.get("market_value")),
+    ) if v is None]
+    if missing:
+        r.add("风控数据完整性", False,
+              "买单缺少风控字段:" + "、".join(missing),
+              hint="这些字段决定集中度与现金底线两道闸门能不能算。缺一项就 fail-closed —— "
+                   "用 get_portfolio / get_equity_positions 读齐再下。"
+                   "(未持仓时 position.market_value 显式填 0)")
+        return
+
+    if True:
         bp = float(bp)
         r.add(
             "买力充足",
@@ -771,6 +948,21 @@ def run(order: dict, cfg: dict, now: dt.datetime | None = None, vocab=None) -> R
     vocab = vocab or load_vocabulary()
     r = Result()
 
+    # ★ 结构先行,数值在后。字段类型不对时后面每一道闸门都可能抛异常 ——
+    # 而在自动化链路里,**崩溃不等于拒绝**:调用方看到的是 traceback,
+    # 很容易被当成偶发故障重试一次。所以结构不合法就地 DENY,不再往下算。
+    order_errs = validate_order(order if isinstance(order, dict) else {})
+    cfg_errs = validate_config(cfg if isinstance(cfg, dict) else {})
+    if order_errs or cfg_errs:
+        for e in order_errs:
+            r.add("订单结构", False, e)
+        for e in cfg_errs:
+            r.add("配置结构", False, e,
+                  hint="TOML 的 true/false 不要加引号 —— 带引号的 \"false\" 是非空字符串,"
+                       "在 Python 里等于真。")
+        r.verdict = DENY
+        return r
+
     check_kill_switch(r, cfg)
     check_execution_enabled(r, cfg)
     check_config_valid(r, cfg)
@@ -788,7 +980,7 @@ def run(order: dict, cfg: dict, now: dt.datetime | None = None, vocab=None) -> R
 
     if r.blockers:
         r.verdict = DENY
-    elif bool(cfg.get("execution", {}).get("dry_run", True)):
+    elif cfg.get("execution", {}).get("dry_run", True) is not False:
         r.verdict = DRY_RUN
     else:
         r.verdict = ALLOW
@@ -825,29 +1017,36 @@ def print_report(r: Result, cfg: dict, order: dict) -> None:
 def write_drill_evidence(order: dict, r: Result) -> None:
     """把本次判定写进演练证据日志。
 
-    ★ 为什么需要它:`--record-drill` 原本只接受 agent 自报的六个布尔值,
-    也就是**让被检查方出具检查结论**。证据行只有真的跑过闸门才会出现,
-    run id 由 `setup.py --start-drill` 生成,agent 编不出来。
+    ★ run id **不取自订单**。订单里的 `drill_run_id` 只是"我想为演练留证据"
+    这个意图;真正写进证据的 id 来自 `data/setup-state.json` 里的 active run。
+    旧实现直接采信订单里的 id —— 于是不跑 `--start-drill`、自造一个 id,
+    就能凭空造出一条证据。证据链的锚点不能由被验证方指定。
 
     写失败不阻断下单 —— 记录演练是次要目的,拦截坏单才是主要目的。
     """
-    run_id = str(order.get("drill_run_id", "") or "").strip()
-    if not run_id:
+    if not str(order.get("drill_run_id", "") or "").strip():
         return
     try:
-        from setup import DRILL_LOG
+        from setup import active_drill_run, append_drill_evidence
 
-        DRILL_LOG.parent.mkdir(parents=True, exist_ok=True)
-        rec = {
-            "run_id": run_id,
-            "at": now_et().strftime("%Y-%m-%d %H:%M:%S ET"),
-            "symbol": str(order.get("symbol", "")),
-            "side": str(order.get("side", "")),
-            "verdict": r.verdict,
-            "blockers": [c.name for c in r.blockers],
-        }
-        with DRILL_LOG.open("a", encoding="utf-8") as fh:
-            fh.write(json.dumps(rec, ensure_ascii=False) + "\n")
+        active = active_drill_run()
+        if not active.get("run_id"):
+            return
+        if str(order["drill_run_id"]).strip() != active["run_id"]:
+            return                       # 对不上就不写,也不报错
+        rec = append_drill_evidence(
+            "preflight",
+            f"{order.get('side')} {order.get('symbol')} → {r.verdict}",
+        )
+        if rec:
+            from setup import DRILL_LOG
+
+            lines = DRILL_LOG.read_text(encoding="utf-8").splitlines()
+            last = json.loads(lines[-1])
+            last["verdict"] = r.verdict
+            last["blockers"] = [c.name for c in r.blockers]
+            lines[-1] = json.dumps(last, ensure_ascii=False)
+            DRILL_LOG.write_text("\n".join(lines) + "\n", encoding="utf-8")
     except Exception:                             # noqa: BLE001
         pass
 
