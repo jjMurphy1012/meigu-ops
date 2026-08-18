@@ -59,6 +59,7 @@ from meigu_lib import (
     ROOT,
     ConfigError,
     load_vocabulary,
+    now_et,
     rel_to_root,
     today_et,
 )
@@ -80,6 +81,13 @@ STRONG = "strong"
 VALID_STATUS = ("invariant", "enforced", "hypothesis", "provisional",
                 "supported", "refuted", "retired")
 VALID_KIND = ("process", "market")
+
+# 规则是谁写的。
+# `ai` 不是"低一等的规则" —— 它走完全相同的生命周期、同样的样本门槛、
+# 同样需要你批准才能升级。记 origin 只是为了让复盘时能分开看:
+# **我自己写的规则和 AI 代拟的规则,哪一类被数据推翻得更多?**
+# 这个问题只有留下出处才答得出来。
+VALID_ORIGIN = ("user", "ai")
 VALID_TEST_TYPES = ("enforced_by", "tag_compare", "manual")
 VALID_SCOPE = ("live", "observe", "none")
 
@@ -131,6 +139,8 @@ class Rule:
     test: dict = field(default_factory=dict)
     status: str = "hypothesis"
     execution_scope: str = ""          # 空 = 按 status 推导
+    origin: str = "user"               # user = 你自己写的;ai = AI 代拟、你确认过的
+    approved_at: str = ""              # origin=ai 时:你确认的时间
     min_samples: int | None = None
     weak_min_samples: int | None = None
     evidence: list[str] = field(default_factory=list)
@@ -210,6 +220,12 @@ def _validate(rule: Rule, seen: set[str], vocab_tags: set[str],
         errs.append(f"{rule.id}: kind 必须是 {'/'.join(VALID_KIND)},实际 {rule.kind!r}")
     if rule.status not in VALID_STATUS:
         errs.append(f"{rule.id}: status 必须是 {'/'.join(VALID_STATUS)},实际 {rule.status!r}")
+    if rule.origin not in VALID_ORIGIN:
+        errs.append(f"{rule.id}: origin 必须是 {'/'.join(VALID_ORIGIN)},实际 {rule.origin!r}")
+    if rule.origin == "ai" and not rule.approved_at:
+        # AI 代拟的规则必须留下"你确认过"的时间戳。没有它就分不清
+        # "用户选择了信任 AI" 和 "AI 自己往文件里写了一条" —— 那正是要防的。
+        errs.append(f"{rule.id}: origin=ai 必须有 approved_at(用户确认的时间)")
     if rule.execution_scope and rule.execution_scope not in VALID_SCOPE:
         errs.append(
             f"{rule.id}: execution_scope 必须是 {'/'.join(VALID_SCOPE)},"
@@ -303,6 +319,8 @@ def load_rules(required: bool = False, path: Path | None = None,
                 test=dict(item.get("test") or {}),
                 status=str(item.get("status", "hypothesis")),
                 execution_scope=str(item.get("execution_scope", "")),
+                origin=str(item.get("origin", "user")),
+                approved_at=str(item.get("approved_at", "")),
                 min_samples=item.get("min_samples"),
                 weak_min_samples=item.get("weak_min_samples"),
                 evidence=[str(e) for e in (item.get("evidence") or [])],
@@ -577,8 +595,16 @@ def set_status(rule_id: str, status: str, note: str = "",
 
 
 def add_rule(rule_id: str, statement: str, kind: str = "market",
-             test: str = "", path: Path | None = None) -> str:
-    """新增一条假设。默认 hypothesis(→ observe),不能直接指导满额下单。"""
+             test: str = "", path: Path | None = None,
+             origin: str = "user", approved: bool = False) -> str:
+    """新增一条假设。默认 hypothesis(→ observe),不能直接指导满额下单。
+
+    `origin="ai"` 是"我不想自己定策略,由 AI 代拟"这条路径的落点:
+    **必须 `approved=True`** —— 也就是你看过这条规则的原文、听过免责声明、
+    明确说了可以。写进文件之后它和你自己写的规则**没有任何区别**:
+    同样从 hypothesis 起步、同样按最低档尺寸、同样要靠台账数据才能升级、
+    同样会被数据推翻。
+    """
     path = path or (CONFIG_DIR / "rules.toml")
     raw = path.read_text(encoding="utf-8")
     try:
@@ -589,6 +615,19 @@ def add_rule(rule_id: str, statement: str, kind: str = "market",
             raise
     if kind not in VALID_KIND:
         raise ConfigError(f"kind 必须是 {'/'.join(VALID_KIND)},实际 {kind!r}")
+    if origin not in VALID_ORIGIN:
+        raise ConfigError(f"origin 必须是 {'/'.join(VALID_ORIGIN)},实际 {origin!r}")
+    if origin == "ai" and not approved:
+        raise ConfigError(
+            "AI 代拟的规则需要用户明确确认后才能写入。\n"
+            "  先向用户完整念出规则原文与免责声明,得到确认后再加 --approved。\n"
+            "  免责:AI 代拟的策略同样可能是错的,它没有你的风险承受能力信息,"
+            "也不对结果负责。它和你自己写的规则一样,要靠你的台账数据来检验。"
+        )
+    origin_lines = ""
+    if origin == "ai":
+        origin_lines = (f'origin    = "ai"\n'
+                        f'approved_at = {_toml_str(now_et().strftime("%Y-%m-%d %H:%M ET"))}\n')
     test_line = test or '{ type = "manual", how = "复盘时人工核查(待补:怎么查)" }'
     block = f"""
 
@@ -598,11 +637,14 @@ statement = {_toml_str(statement)}
 kind      = {_toml_str(kind)}
 test      = {test_line}
 status    = "hypothesis"
-evidence  = []
+{origin_lines}evidence  = []
 last_audited = ""
 """
     _atomic_write(path, raw.rstrip("\n") + block)
-    return f"已新增 {rule_id}(hypothesis → observe,尺寸按最低档)"
+    who = "AI 代拟、你已确认" if origin == "ai" else "你自己写的"
+    return (f"已新增 {rule_id}({who};hypothesis → observe,尺寸按最低档)\n"
+            f"  它从现在起走和其他规则完全一样的流程:靠台账数据检验,"
+            f"升级要你批准,被推翻就降级。")
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -619,6 +661,8 @@ def main(argv: list[str] | None = None) -> int:
     ap.add_argument("--add-rule", nargs=2, metavar=("ID", "STATEMENT"),
                     help="新增一条假设(默认 hypothesis → observe)")
     ap.add_argument("--kind", default="market", help="配合 --add-rule")
+    ap.add_argument("--origin", default="user", choices=list(VALID_ORIGIN),
+                    help="配合 --add-rule:user = 你自己写的;ai = AI 代拟(需 --approved)")
     args = ap.parse_args(argv)
 
     target = Path(args.file) if args.file else None
@@ -628,7 +672,8 @@ def main(argv: list[str] | None = None) -> int:
             return 0
         if args.add_rule:
             print("✅ " + add_rule(args.add_rule[0], args.add_rule[1],
-                                  kind=args.kind, path=target))
+                                  kind=args.kind, path=target,
+                                  origin=args.origin, approved=args.approved))
             return 0
         if args.set_status:
             if not args.approved:

@@ -12,7 +12,7 @@
 <p align="center">
   <img src="https://img.shields.io/badge/Python-3.11+-3776AB?style=flat&logo=python&logoColor=white" alt="Python 3.11+">
   <img src="https://img.shields.io/badge/dependencies-none-2ea44f?style=flat" alt="Zero dependencies">
-  <img src="https://img.shields.io/badge/tests-334%20passing-2ea44f?style=flat" alt="334 tests">
+  <img src="https://img.shields.io/badge/tests-339%20passing-2ea44f?style=flat" alt="339 tests">
   <a href="https://claude.com/claude-code"><img src="https://img.shields.io/badge/Built_with-Claude_Code-000?style=flat&logo=anthropic&logoColor=white" alt="Built with Claude Code"></a>
   <img src="https://img.shields.io/badge/License-MIT-blue.svg" alt="MIT">
   <a href="DISCLAIMER.md"><img src="https://img.shields.io/badge/%E2%9A%A0%EF%B8%8F-%E4%B8%8D%E6%9E%84%E6%88%90%E6%8A%95%E8%B5%84%E5%BB%BA%E8%AE%AE-critical" alt="Not investment advice"></a>
@@ -68,8 +68,16 @@
 最后——也是最花时间的一部分——把"这条规则到底成不成立"
 变成一个能被台账数据回答的问题，而不是一个凭印象争论的问题。
 
+跑到现在，最明显的变化不是某一笔赚得多，而是**账目变稳了**：
+规则被写下来、被台账检验、被逐条修正之后，收益的波动明显收窄，
+目前能稳定保持在 5% 左右。对我来说，"稳定"比"更高"更有意义——
+前者说明机制在起作用，后者可能只是运气。
+
 > 你在这个仓库里找不到我的那几条纪律。它们对你没有意义，
 > 而且我自己也在不断修正它们。**留下的是那套让纪律能被检验、能被推翻的机制。**
+>
+> 上面那个数字是我自己账户的经历，不是这套系统的承诺，
+> 更不构成任何收益预期——同一套机制配上不同的规则，结果可能完全相反。
 
 ## 它做什么
 
@@ -127,8 +135,44 @@ make setup        # ★ 从这里开始
 那时 MCP 的问题和项目配置的问题已经混在一起。但**连接成功不等于获得下单权限**:
 第 2 步全程只读,连 `place_equity_order` 都不会被调用。
 
-第 4 步是这个项目的重点。`modes/_strategy.example.md` 里全是问题、没有答案 ——
-那些答案必须由你自己写。起步建议:**先只写 2–3 条你最相信的规则**。
+第 4 步是这个项目的重点。`modes/_strategy.example.md` 里全是问题、没有答案。
+起步建议:**先只写 2–3 条你最相信的规则** —— 十条没被检验过的规则,
+不如两条被数据支持过的。
+
+### 如果你根本不想自己定策略
+
+那也是一条正式路径,不是走偏。第 4 步会先问你:
+
+```
+1. 我自己写 —— 陪我回答那些问题,把我的判断变成规则
+2. 我不想自己定 —— 你按当时的分析来定,我确认
+```
+
+选 2 时,AI 会先把免责讲清楚,再逐条把规则原文念给你:
+
+> 我提的策略同样可能是错的,它没有经过你的账户数据检验;
+> 我不掌握你的风险承受能力、资金用途和时间尺度;
+> 最终的交易决策与结果由你负责,这不构成投资建议。
+
+**你确认之后**,这条规则才会被写进 `config/rules.toml`,并带上
+`origin = "ai"` 与 `approved_at`(你确认的时间)。没有 `--approved`
+脚本会直接拒绝写入 —— 有这两个字段,才分得清"你选择了信任 AI"和
+"AI 自己往文件里写了一条"。
+
+**写进去之后,它和你自己写的规则没有任何区别:**
+
+| | 你写的规则 | AI 代拟、你确认的规则 |
+|---|---|---|
+| 起始状态 | `hypothesis` | `hypothesis` |
+| 起始仓位档 | 最低档 | 最低档 |
+| 升级条件 | 台账数据支持 + **你批准** | 台账数据支持 + **你批准** |
+| 被数据推翻 | 降为 `refuted` | 降为 `refuted` |
+
+也就是说:**你可以把"定策略"这件事交给 AI,但不能把"检验策略"这件事交出去。**
+检验只能由你的真实台账完成 —— 这恰恰是整个项目存在的理由。
+
+复盘时还能按 `origin` 分开看一个很值得问的问题:
+**我自己写的规则和 AI 代拟的规则,哪一类被数据推翻得更多?**
 
 **只想看看效果、不连券商?**
 

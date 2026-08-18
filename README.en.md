@@ -12,7 +12,7 @@
 <p align="center">
   <img src="https://img.shields.io/badge/Python-3.11+-3776AB?style=flat&logo=python&logoColor=white" alt="Python 3.11+">
   <img src="https://img.shields.io/badge/dependencies-none-2ea44f?style=flat" alt="Zero dependencies">
-  <img src="https://img.shields.io/badge/tests-334%20passing-2ea44f?style=flat" alt="334 tests">
+  <img src="https://img.shields.io/badge/tests-339%20passing-2ea44f?style=flat" alt="339 tests">
   <a href="https://claude.com/claude-code"><img src="https://img.shields.io/badge/Built_with-Claude_Code-000?style=flat&logo=anthropic&logoColor=white" alt="Built with Claude Code"></a>
   <img src="https://img.shields.io/badge/License-MIT-blue.svg" alt="MIT">
   <a href="DISCLAIMER.md"><img src="https://img.shields.io/badge/%E2%9A%A0%EF%B8%8F-not_investment_advice-critical" alt="Not investment advice"></a>
@@ -105,8 +105,21 @@ make report
 ```
 
 **Step four is the point of this project, and the slowest step.** `_strategy.example.md`
-is all questions and no answers — those answers must be yours. Start with **2–3 rules you
-believe most**. Ten untested rules are worth less than two the data has supported.
+is all questions and no answers. Start with **2–3 rules you believe most** — ten untested
+rules are worth less than two the data has supported.
+
+**Don't want to define a strategy yourself?** That is a supported path, not a workaround.
+Step four asks which route you want: write your own, or have the AI draft rules from its
+own analysis. Choosing the latter, the AI must first state the disclaimer (its rules can
+be wrong too; it does not know your risk tolerance; the decisions and outcomes remain
+yours), then read each proposed rule to you verbatim. Only after **your explicit
+confirmation** is the rule written, tagged `origin = "ai"` with an `approved_at`
+timestamp — `rules.py` refuses to write it without `--approved`.
+
+From then on it is an ordinary rule: same `hypothesis` start, same lowest size tier,
+same requirement that your ledger data (and your approval) is what promotes it, same
+demotion when the data refutes it. **You can delegate writing the strategy; you cannot
+delegate testing it.**
 
 Full setup: [docs/SETUP.md](docs/SETUP.md).
 

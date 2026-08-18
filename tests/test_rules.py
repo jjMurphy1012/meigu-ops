@@ -364,6 +364,45 @@ last_audited = ""
         self.assertEqual(r.scope, "observe")
         self.assertFalse(r.may_authorize_live)
 
+    def test_ai_authored_rule_requires_explicit_approval(self):
+        """★ "让 AI 代拟策略"是一条正式路径,但必须由用户选择并确认。
+
+        没有这道闸,"AI 可以提规则"就等于"AI 可以自己往策略文件里写东西"。
+        """
+        with self.assertRaises(ConfigError) as ctx:
+            R.add_rule("ai1", "AI 提的命题", path=self.path, origin="ai")
+        self.assertIn("确认", str(ctx.exception))
+
+    def test_approved_ai_rule_is_written_with_provenance(self):
+        R.add_rule("ai1", "AI 提的命题", path=self.path, origin="ai", approved=True)
+        r = self._rule("ai1")
+        self.assertEqual(r.origin, "ai")
+        self.assertTrue(r.approved_at, "origin=ai 必须留下用户确认的时间")
+
+    def test_ai_rule_enters_the_same_lifecycle(self):
+        """代拟的规则不享受任何特权:同样 hypothesis 起步、同样最低档。"""
+        R.add_rule("ai1", "AI 提的命题", path=self.path, origin="ai", approved=True)
+        user = R.add_rule("u9", "我自己写的命题", path=self.path) and self._rule("u9")
+        ai = self._rule("ai1")
+        self.assertEqual((ai.status, ai.scope), (user.status, user.scope))
+        self.assertFalse(ai.may_authorize_live)
+
+    def test_ai_origin_without_approved_at_is_invalid(self):
+        """手写进文件也绕不过 —— 校验层同样要求 approved_at。"""
+        self.path.write_text(
+            self.path.read_text(encoding="utf-8")
+            + '\n[[rule]]\nid = "sneaky"\nstatement = "偷偷加的"\n'
+              'kind = "market"\nstatus = "hypothesis"\norigin = "ai"\n'
+              'test = { type = "manual", how = "x" }\n',
+            encoding="utf-8")
+        with self.assertRaises(ConfigError) as ctx:
+            load_rules(path=self.path)
+        self.assertIn("approved_at", str(ctx.exception))
+
+    def test_unknown_origin_rejected(self):
+        with self.assertRaises(ConfigError):
+            R.add_rule("x9", "x", path=self.path, origin="nobody")
+
     def test_add_rule_rejects_duplicate_id(self):
         with self.assertRaises(ConfigError) as ctx:
             R.add_rule("w1", "重复 id", path=self.path)

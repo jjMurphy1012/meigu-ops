@@ -33,7 +33,9 @@ license: MIT
 
 > ⚠️ **本仓库不提供任何交易策略。** 上面第 3 步的四个文件都已 gitignore,
 > 对应的模板是 `*.example.*`。若它们不存在,说明用户还没有定义自己的策略 ——
-> **此时不要用模板里的占位值做决策,也不要自行编造规则**,而是停下来提示用户先完成:
+> **此时不要用模板里的占位值做决策,也不要自行编造规则**,而是停下来提示用户先完成
+> (用户若明确说"我不想自己定策略,你来定",走 `modes/setup.md` 第 4 步的路线 2:
+> 先声明免责 → 逐条念规则原文 → 用户确认 → `rules.py --add-rule --origin ai --approved`):
 >
 > ```bash
 > cp config/profile.example.toml      config/profile.toml
