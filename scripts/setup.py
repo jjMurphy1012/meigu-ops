@@ -36,14 +36,22 @@ MCP 工具只有 agent 能调,Python 脚本调不了。所以:
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
+import os
+import secrets
 import sys
+import tomllib
 from dataclasses import dataclass, field
 from pathlib import Path
 
 from meigu_lib import CONFIG_DIR, DATA_DIR, ROOT, ConfigError, now_et
 
 STATE_FILE = DATA_DIR / "setup-state.json"
+SALT_FILE = DATA_DIR / ".setup-salt"
+DRILL_LOG = DATA_DIR / "drill-runs.jsonl"
+
+LIVE_MODES = ("guarded", "autonomous")
 
 UNINITIALIZED = "UNINITIALIZED"
 MCP_CONNECTED_READONLY = "MCP_CONNECTED_READONLY"
@@ -107,6 +115,102 @@ def _read_profile() -> dict:
         return {}
 
 
+def _salt() -> str:
+    """本机盐值。只用于账户指纹,不参与任何加密。
+
+    有盐才能让指纹既能比对、又不可反推 —— 券商账户号的搜索空间太小,
+    不加盐的 sha256 等于明文。文件属于用户层,已 gitignore。
+    """
+    if SALT_FILE.exists():
+        s = SALT_FILE.read_text(encoding="utf-8").strip()
+        if s:
+            return s
+    DATA_DIR.mkdir(parents=True, exist_ok=True)
+    s = secrets.token_hex(16)
+    SALT_FILE.write_text(s + "\n", encoding="utf-8")
+    try:
+        SALT_FILE.chmod(0o600)
+    except OSError:
+        pass
+    return s
+
+
+def account_fingerprint(account_id: str) -> str:
+    """账户的不可逆指纹。
+
+    ★ 为什么不存后 4 位就够:后 4 位相同的两个账户会被认成同一个,
+    而"换了账户但状态没失效"正是这套状态机要防的事。指纹一变,
+    只读验证与演练记录**自动失效** —— 不需要谁记得去清理。
+    """
+    norm = "".join(ch for ch in str(account_id) if ch.isalnum()).lower()
+    if not norm:
+        return ""
+    return hashlib.sha256((_salt() + ":" + norm).encode()).hexdigest()
+
+
+def current_account_fingerprint() -> str:
+    acct = str(_read_profile().get("account", {}).get("id", "")).strip()
+    if not acct or acct in PLACEHOLDER_ACCOUNTS:
+        return ""
+    return account_fingerprint(acct)
+
+
+def validate_execution(cfg: dict) -> list[str]:
+    """执行参数的取值校验 —— 存在不等于合法。
+
+    一个负数上限、一个 0 笔数、一个指向仓外的 kill switch,都会在运行时
+    变成"没有上限"。所以这里检查的是**值**,不只是**有没有**。
+    """
+    ex = cfg.get("execution", {})
+    errs: list[str] = []
+
+    for k in ("max_order_usd", "max_daily_usd"):
+        v = ex.get(k)
+        if v is None:
+            errs.append(f"execution.{k} 未设置")
+        elif not isinstance(v, (int, float)) or isinstance(v, bool):
+            errs.append(f"execution.{k} 必须是数字,实际 {v!r}")
+        elif v <= 0:
+            errs.append(f"execution.{k} 必须 > 0,实际 {v}")
+
+    n = ex.get("max_orders_per_day")
+    if n is None:
+        errs.append("execution.max_orders_per_day 未设置")
+    elif not isinstance(n, int) or isinstance(n, bool):
+        errs.append(f"execution.max_orders_per_day 必须是整数,实际 {n!r}")
+    elif n < 1:
+        errs.append(f"execution.max_orders_per_day 必须 >= 1,实际 {n}")
+
+    for k in ("size_scale_observe", "size_scale_weak", "size_scale_supported"):
+        v = ex.get(k)
+        if v is None:
+            continue
+        if not isinstance(v, (int, float)) or isinstance(v, bool):
+            errs.append(f"execution.{k} 必须是数字,实际 {v!r}")
+        elif not (0 < v <= 1):
+            errs.append(f"execution.{k} 必须落在 (0, 1],实际 {v} —— 尺寸系数不能放大基准上限")
+
+    mode = ex.get("live_mode", "guarded")
+    if mode not in LIVE_MODES:
+        errs.append(f"execution.live_mode 只能是 {' | '.join(LIVE_MODES)},实际 {mode!r}")
+
+    ks = ex.get("kill_switch_file")
+    if not ks:
+        errs.append("execution.kill_switch_file 未设置")
+    elif not isinstance(ks, str):
+        errs.append(f"execution.kill_switch_file 必须是字符串,实际 {ks!r}")
+    else:
+        pk = Path(ks)
+        if pk.is_absolute():
+            errs.append("execution.kill_switch_file 必须是仓库内相对路径")
+        else:
+            try:
+                (ROOT / pk).resolve().relative_to(ROOT.resolve())
+            except ValueError:
+                errs.append(f"execution.kill_switch_file 指向仓库之外:{ks}")
+    return errs
+
+
 def _load_state() -> dict:
     if not STATE_FILE.exists():
         return {}
@@ -117,10 +221,18 @@ def _load_state() -> dict:
 
 
 def _save_state(state: dict) -> None:
+    """原子写 —— 半截 JSON 会让状态机在下次读取时静默退回空状态。
+
+    `write_text` 中途被打断会留下截断文件;而 `_load_state` 遇到坏 JSON 返回 {},
+    于是"验证过"变成"没验证过",或者更糟:配合旧配置变成状态与实盘开关不一致。
+    """
     DATA_DIR.mkdir(parents=True, exist_ok=True)
-    STATE_FILE.write_text(
-        json.dumps(state, ensure_ascii=False, indent=2), encoding="utf-8"
-    )
+    tmp = STATE_FILE.with_suffix(".json.tmp")
+    with tmp.open("w", encoding="utf-8") as fh:
+        json.dump(state, fh, ensure_ascii=False, indent=2)
+        fh.flush()
+        os.fsync(fh.fileno())
+    os.replace(tmp, STATE_FILE)
 
 
 # ------------------------------------------------------------------ 各步判定
@@ -138,12 +250,24 @@ def check_uninitialized() -> Step:
 
 def check_mcp(state: dict) -> Step:
     rec = state.get("mcp_check") or {}
+    todo = ["跑 `/meigu-ops setup`,由 agent 执行只读验证并写回结果",
+            "只读:读账户 / 持仓 / 买力 / 带时间戳的报价 / review 可用",
+            "**不要**调用 place_equity_order —— 这一步只确认能连上、连对账户"]
     if not rec.get("passed"):
+        return Step(MCP_CONNECTED_READONLY, False, "尚未完成券商 MCP 只读验证", todo)
+
+    # ★ 指纹绑定:验证是针对**某一个具体账户**做的,换了账户就得重做。
+    # 只存后 4 位不够 —— 后 4 位相同的两个账户会被认成同一个。
+    cur = current_account_fingerprint()
+    if not cur:
+        return Step(MCP_CONNECTED_READONLY, False,
+                    "配置里没有有效账户号 —— 之前的只读验证无从绑定", todo)
+    if rec.get("account_fp") != cur:
         return Step(
-            MCP_CONNECTED_READONLY, False, "尚未完成券商 MCP 只读验证",
-            ["跑 `/meigu-ops setup`,由 agent 执行只读验证并写回结果",
-             "只读:读账户 / 持仓 / 买力 / 带时间戳的报价 / review 可用",
-             "**不要**调用 place_equity_order —— 这一步只确认能连上、连对账户"],
+            MCP_CONNECTED_READONLY, False,
+            "配置里的账户与当时验证过的账户不是同一个 —— 只读验证已自动失效",
+            ["换账户后必须对**新账户**重新做一遍只读验证",
+             "演练记录同样失效(它也绑定在账户指纹上)"],
         )
     return Step(MCP_CONNECTED_READONLY, True,
                 f"已验证(账户 ***{rec.get('account_last4', '????')},"
@@ -164,9 +288,7 @@ def check_profile() -> Step:
     if acct in PLACEHOLDER_ACCOUNTS:
         todo.append("account.id 仍是占位值 —— 填入你自己验证过的子账户号")
     ex = cfg.get("execution", {})
-    for k in ("max_order_usd", "max_daily_usd", "max_orders_per_day", "kill_switch_file"):
-        if not ex.get(k):
-            todo.append(f"execution.{k} 未设置")
+    todo.extend(validate_execution(cfg))
     return Step(PROFILE_READY, not todo,
                 f"账户 ***{acct[-4:]} · 单笔 ${ex.get('max_order_usd')} / "
                 f"单日 ${ex.get('max_daily_usd')} / {ex.get('max_orders_per_day')} 笔"
@@ -205,6 +327,10 @@ def check_strategy() -> Step:
 
 def check_automation(state: dict) -> Step:
     rec = state.get("drill") or {}
+    if rec.get("passed") and rec.get("account_fp") != current_account_fingerprint():
+        return Step(AUTOMATION_READY, False,
+                    "演练是针对另一个账户做的 —— 已自动失效",
+                    ["对当前账户重新跑一遍 dry-run 演练"])
     if not rec.get("passed"):
         return Step(
             AUTOMATION_READY, False, "尚未完成 dry-run 端到端演练",
@@ -224,6 +350,10 @@ def check_live() -> Step:
         return Step(LIVE_AUTHORIZED, False, "真钱执行未开启(这是默认且安全的状态)",
                     ["确认前面全部通过后,用 setup.py --authorize-live 开启"])
     mode = str(ex.get("live_mode", "guarded"))
+    if mode not in LIVE_MODES:
+        return Step(LIVE_AUTHORIZED, False,
+                    f"live_mode = {mode!r} 不是合法值 —— fail-closed",
+                    [f"只能是 {' | '.join(LIVE_MODES)}"])
     dry = ex.get("dry_run", True)
     if dry:
         return Step(LIVE_AUTHORIZED, False, "enabled=true 但仍在 dry_run",
@@ -285,6 +415,7 @@ def record_mcp(payload: dict) -> str:
     state["mcp_check"] = {
         "passed": True,
         "at": now_et().strftime("%Y-%m-%d %H:%M ET"),
+        "account_fp": account_fingerprint(acct),
         "account_last4": acct[-4:],
         "checks": {k: True for k in MCP_CHECKS},
         "notes": str(payload.get("notes", "")),
@@ -293,30 +424,164 @@ def record_mcp(payload: dict) -> str:
     return f"券商只读验证已记录(账户 ***{acct[-4:]},{len(MCP_CHECKS)} 项全部通过)"
 
 
+def start_drill() -> str:
+    """开一次 dry-run 演练,返回 run id。
+
+    演练是否真的跑过,不能由 agent 报六个布尔值说了算 —— 那是**自证**。
+    这里生成一个 run id,后续每次 `preflight.py` 运行都会把带该 id 的证据
+    追加进 `data/drill-runs.jsonl`;`--record-drill` 只认这些证据。
+    """
+    cfg = _read_profile()
+    ex = cfg.get("execution", {})
+    if ex.get("enabled") and not ex.get("dry_run"):
+        raise ConfigError(
+            "当前是真钱模式(enabled=true 且 dry_run=false)—— 演练必须在 dry_run 下进行。"
+        )
+    fp = current_account_fingerprint()
+    if not fp:
+        raise ConfigError("配置里没有有效账户号,无法开始演练")
+
+    run_id = secrets.token_hex(8)
+    state = _load_state()
+    state["drill_active"] = {
+        "run_id": run_id,
+        "started_at": now_et().strftime("%Y-%m-%d %H:%M ET"),
+        "account_fp": fp,
+    }
+    _save_state(state)
+    return run_id
+
+
+def active_drill_run() -> dict:
+    return (_load_state().get("drill_active") or {})
+
+
+def drill_evidence(run_id: str) -> list[dict]:
+    """读 preflight 写下的演练证据。"""
+    if not DRILL_LOG.exists() or not run_id:
+        return []
+    out = []
+    for line in DRILL_LOG.read_text(encoding="utf-8").splitlines():
+        line = line.strip()
+        if not line:
+            continue
+        try:
+            rec = json.loads(line)
+        except json.JSONDecodeError:
+            continue
+        if rec.get("run_id") == run_id:
+            out.append(rec)
+    return out
+
+
 def record_drill(payload: dict) -> str:
-    """校验并记录 dry-run 端到端演练结果。"""
+    """校验并记录 dry-run 端到端演练结果。
+
+    三道校验,缺一不可:
+      ① 前置状态(只读验证 + 账户配置 + 自己的策略)确实就绪
+      ② 记录时确实处于 dry_run —— 不能在真钱模式下把"演练"记成完成
+      ③ 存在**由 preflight 写下的**证据,且判定确实是 DRY_RUN
+    第三条是关键:布尔值可以随口填,证据行必须真的跑过闸门才会出现。
+    """
+    state = _load_state()
+
+    for step in (check_mcp(state), check_profile(), check_strategy()):
+        if not step.ok:
+            raise ConfigError(f"演练的前置步骤未就绪 —— {step.state}: {step.detail}")
+
+    ex = _read_profile().get("execution", {})
+    if ex.get("enabled") and not ex.get("dry_run"):
+        raise ConfigError(
+            "当前处于真钱模式 —— 在 enabled=true 且 dry_run=false 下跑出来的不是演练。"
+        )
+
     missing = [k for k in DRILL_CHECKS if not payload.get(k)]
     if missing:
         raise ConfigError(
             "演练未通过,以下环节没有确认为 true:\n  "
             + "\n  ".join(f"{k} —— {DRILL_CHECKS[k]}" for k in missing)
         )
-    state = _load_state()
+
+    active = active_drill_run()
+    run_id = str(payload.get("run_id", "") or active.get("run_id", "")).strip()
+    if not run_id:
+        raise ConfigError(
+            "没有进行中的演练 —— 先跑 `python3 scripts/setup.py --start-drill` 拿到 run id,"
+            "再用它跑一遍 preflight。"
+        )
+    if active.get("run_id") and run_id != active["run_id"]:
+        raise ConfigError("提交的 run_id 与进行中的演练不一致")
+
+    fp = current_account_fingerprint()
+    if active.get("account_fp") and active["account_fp"] != fp:
+        raise ConfigError("演练开始时的账户与当前配置的账户不是同一个 —— 重新开始演练")
+
+    ev = drill_evidence(run_id)
+    if not ev:
+        raise ConfigError(
+            f"找不到 run {run_id} 的演练证据 —— preflight 没有以该 run id 跑过。\n"
+            f"在订单 JSON 里加 \"drill_run_id\": \"{run_id}\" 再跑 preflight。"
+        )
+    dry_runs = [e for e in ev if e.get("verdict") == "DRY_RUN"]
+    if not dry_runs:
+        raise ConfigError(
+            f"run {run_id} 有 {len(ev)} 条证据,但没有一条判定为 DRY_RUN —— "
+            f"演练要求走完闸门并停在模拟下单。"
+        )
+
     state["drill"] = {
         "passed": True,
         "at": now_et().strftime("%Y-%m-%d %H:%M ET"),
+        "run_id": run_id,
+        "account_fp": fp,
+        "evidence_count": len(dry_runs),
         "checks": {k: True for k in DRILL_CHECKS},
         "notes": str(payload.get("notes", "")),
     }
+    state.pop("drill_active", None)
     _save_state(state)
-    return f"dry-run 演练已记录({len(DRILL_CHECKS)} 个环节全部跑通)"
+    return (f"dry-run 演练已记录(run {run_id} · {len(dry_runs)} 条 preflight 证据 · "
+            f"{len(DRILL_CHECKS)} 个环节)")
+
+
+def _set_execution_key(text: str, key: str, literal: str) -> str:
+    """在 `[execution]` 段内设置一个键 —— 存在则改,不存在则插入。
+
+    旧实现只做正则替换:配置里若没有 `enabled` 这一行,替换命中零次,
+    函数照样返回"授权成功" —— **提示成功、实际没开**。这是最坏的一类失败:
+    用户以为开了,系统按没开跑;反过来也可能。所以这里必须区分"改"和"插"。
+    """
+    import re
+
+    lines = text.splitlines()
+    start = None
+    for i, ln in enumerate(lines):
+        if re.match(r"^\s*\[execution\]\s*$", ln):
+            start = i
+            break
+    if start is None:
+        return text.rstrip("\n") + f"\n\n[execution]\n{key} = {literal}\n"
+
+    end = len(lines)
+    for i in range(start + 1, len(lines)):
+        if re.match(r"^\s*\[", lines[i]):
+            end = i
+            break
+
+    for i in range(start + 1, end):
+        if re.match(rf"^\s*{re.escape(key)}\s*=", lines[i]):
+            lines[i] = f"{key} = {literal}"
+            return "\n".join(lines) + ("\n" if text.endswith("\n") else "")
+
+    lines.insert(start + 1, f"{key} = {literal}")
+    return "\n".join(lines) + ("\n" if text.endswith("\n") else "")
 
 
 def authorize_live(mode: str) -> str:
-    """开启真钱执行。前置状态必须全部就绪。"""
-    if mode not in ("guarded", "autonomous"):
-        raise ConfigError("live_mode 只能是 guarded 或 autonomous")
-    steps, current = evaluate()
+    """开启真钱执行。前置状态必须全部就绪,写入结果必须回读验证。"""
+    if mode not in LIVE_MODES:
+        raise ConfigError(f"live_mode 只能是 {' | '.join(LIVE_MODES)}")
+    steps, _ = evaluate()
     blocked = [s for s in steps[:5] if not s.ok]
     if blocked:
         raise ConfigError(
@@ -326,19 +591,38 @@ def authorize_live(mode: str) -> str:
 
     path = CONFIG_DIR / "profile.toml"
     text = path.read_text(encoding="utf-8")
-    import re
+    for key, literal in (("enabled", "true"), ("dry_run", "false"),
+                         ("live_mode", f'"{mode}"')):
+        text = _set_execution_key(text, key, literal)
 
-    text = re.sub(r"^enabled = .*$", "enabled = true", text, flags=re.M)
-    text = re.sub(r"^dry_run = .*$", "dry_run = false", text, flags=re.M)
-    if re.search(r"^live_mode = ", text, flags=re.M):
-        text = re.sub(r"^live_mode = .*$", f'live_mode = "{mode}"', text, flags=re.M)
-    else:
-        text = re.sub(r"^dry_run = false$",
-                      f'dry_run = false\n# guarded = 仓位统一按最低档;autonomous = 按规则状态缩放\nlive_mode = "{mode}"',
-                      text, flags=re.M)
-    path.write_text(text, encoding="utf-8")
+    # 解析 → 校验 → 原子落盘 → 回读 → 再校验。任何一步不符就不写、不报成功。
+    try:
+        parsed = tomllib.loads(text)
+    except tomllib.TOMLDecodeError as exc:
+        raise ConfigError(f"写入会产生非法 TOML,已放弃:{exc}") from exc
+
+    ex = parsed.get("execution", {})
+    want = {"enabled": True, "dry_run": False, "live_mode": mode}
+    bad = {k: ex.get(k) for k, v in want.items() if ex.get(k) != v}
+    if bad:
+        raise ConfigError(f"写入后的值与预期不符,已放弃:{bad}")
+
+    tmp = path.with_suffix(".toml.tmp")
+    with tmp.open("w", encoding="utf-8") as fh:
+        fh.write(text)
+        fh.flush()
+        os.fsync(fh.fileno())
+    os.replace(tmp, path)
+
+    after = _read_profile().get("execution", {})
+    still_bad = {k: after.get(k) for k, v in want.items() if after.get(k) != v}
+    if still_bad:
+        raise ConfigError(
+            f"回读校验失败,真钱执行**未开启**:{still_bad} —— 请手动检查 config/profile.toml"
+        )
+
     return (
-        f"真钱执行已开启 · live_mode = {mode}\n"
+        f"真钱执行已开启 · live_mode = {mode}(已回读校验)\n"
         f"  仍然无条件生效:单笔/单日金额上限、单日笔数、kill switch\n"
         f"  想立刻全停:touch data/HALTED"
     )
@@ -371,6 +655,8 @@ def main(argv: list[str] | None = None) -> int:
     ap.add_argument("--json", action="store_true")
     ap.add_argument("--record-mcp", action="store_true", help="记录券商只读验证结果")
     ap.add_argument("--record-drill", action="store_true", help="记录 dry-run 演练结果")
+    ap.add_argument("--start-drill", action="store_true",
+                    help="开一次 dry-run 演练,打印 run id(preflight 用它写证据)")
     ap.add_argument("--stdin", action="store_true", help="从 stdin 读 JSON")
     ap.add_argument("--file", help="从文件读 JSON")
     ap.add_argument("--authorize-live", metavar="MODE",
@@ -390,6 +676,12 @@ def main(argv: list[str] | None = None) -> int:
         return 0
 
     try:
+        if args.start_drill:
+            rid = start_drill()
+            print(f"✅ 演练已开始 · run id = {rid}")
+            print(f'   在订单 JSON 里加 "drill_run_id": "{rid}",跑一遍 preflight 即可留下证据。')
+            return 0
+
         if args.record_mcp or args.record_drill:
             raw = (sys.stdin.read() if args.stdin
                    else Path(args.file).read_text(encoding="utf-8") if args.file else "")

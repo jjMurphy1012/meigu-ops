@@ -31,6 +31,62 @@ def full_drill(**over):
     return p
 
 
+PROFILE_OK = """[account]
+id = "555000111"  # privacy-allow(TOML 注释,同时也是逐行豁免标记)
+
+[execution]
+enabled = false
+dry_run = true
+max_order_usd = 80
+max_daily_usd = 200
+max_orders_per_day = 6
+kill_switch_file = "data/HALTED"
+live_mode = "guarded"
+"""
+
+
+def sandbox(case, profile: str = PROFILE_OK):
+    """把状态机的全部落盘路径挪进临时目录。
+
+    不隔离就会读到本机真实的 data/ 与 config/ —— 测试结论会随开发者本机
+    做没做过只读验证而漂移(这个坑已经踩过一次)。
+    """
+    d = Path(tempfile.mkdtemp())
+    (d / "config").mkdir()
+    (d / "data").mkdir()
+    if profile is not None:
+        (d / "config" / "profile.toml").write_text(profile, encoding="utf-8")
+
+    saved = {k: getattr(S, k) for k in
+             ("CONFIG_DIR", "DATA_DIR", "STATE_FILE", "SALT_FILE", "DRILL_LOG")}
+    S.CONFIG_DIR = d / "config"
+    S.DATA_DIR = d / "data"
+    S.STATE_FILE = d / "data" / "setup-state.json"
+    S.SALT_FILE = d / "data" / ".setup-salt"
+    S.DRILL_LOG = d / "data" / "drill-runs.jsonl"
+
+    def restore():
+        for k, v in saved.items():
+            setattr(S, k, v)
+
+    case.addCleanup(restore)
+    return d
+
+
+def stub_prereqs(case):
+    """把演练之前的三步打桩成已就绪 —— 这些步骤本身另有用例覆盖。"""
+    ok = lambda state: S.Step(state, True, "stub")          # noqa: E731
+    saved = (S.check_mcp, S.check_profile, S.check_strategy)
+    S.check_mcp = lambda state: ok(S.MCP_CONNECTED_READONLY)
+    S.check_profile = lambda: ok(S.PROFILE_READY)
+    S.check_strategy = lambda: ok(S.STRATEGY_READY)
+
+    def restore():
+        S.check_mcp, S.check_profile, S.check_strategy = saved
+
+    case.addCleanup(restore)
+
+
 class TestChecklistCompleteness(unittest.TestCase):
     def test_mcp_checklist_covers_the_acceptance_criteria(self):
         """验收标准是**真的读到数据**,不是"检测到配置文件"。"""
@@ -134,21 +190,217 @@ class TestReadonlyDuringVerification(unittest.TestCase):
 
 
 class TestDrillRecord(unittest.TestCase):
+    """★ 演练不能靠自报。
+
+    旧实现只接受六个布尔值 —— 等于让被检查方出具检查结论。现在要求存在
+    **由 preflight 写下的**证据行,run id 由 --start-drill 生成。
+    """
+
     def setUp(self):
-        self._s, S.STATE_FILE = S.STATE_FILE, Path(tempfile.mkdtemp()) / "s.json"
+        self.dir = sandbox(self)
+        stub_prereqs(self)
 
-    def tearDown(self):
-        S.STATE_FILE = self._s
+    def _evidence(self, run_id: str, verdict: str = "DRY_RUN"):
+        S.DRILL_LOG.write_text(
+            json.dumps({"run_id": run_id, "verdict": verdict, "symbol": "AAAA"}) + "\n",
+            encoding="utf-8",
+        )
 
-    def test_full_drill_recorded(self):
+    def test_drill_with_real_evidence_is_recorded(self):
+        rid = S.start_drill()
+        self._evidence(rid)
         S.record_drill(full_drill())
-        self.assertTrue(json.loads(S.STATE_FILE.read_text())["drill"]["passed"])
+        rec = json.loads(S.STATE_FILE.read_text())["drill"]
+        self.assertTrue(rec["passed"])
+        self.assertEqual(rec["run_id"], rid)
+
+    def test_booleans_alone_are_not_enough(self):
+        """六个 true 但从没跑过 preflight —— 必须拒绝。"""
+        S.start_drill()
+        with self.assertRaises(ConfigError) as cm:
+            S.record_drill(full_drill())
+        self.assertIn("证据", str(cm.exception))
+
+    def test_evidence_must_be_a_dry_run_verdict(self):
+        rid = S.start_drill()
+        self._evidence(rid, verdict="DENY")
+        with self.assertRaises(ConfigError):
+            S.record_drill(full_drill())
+
+    def test_drill_cannot_be_started_in_live_mode(self):
+        (S.CONFIG_DIR / "profile.toml").write_text(
+            PROFILE_OK.replace("enabled = false", "enabled = true")
+                      .replace("dry_run = true", "dry_run = false"),
+            encoding="utf-8")
+        with self.assertRaises(ConfigError):
+            S.start_drill()
+
+    def test_drill_cannot_be_recorded_in_live_mode(self):
+        """对抗测试原文:enabled=true, dry_run=false 下仍能记成"演练完成"。"""
+        rid = S.start_drill()
+        self._evidence(rid)
+        (S.CONFIG_DIR / "profile.toml").write_text(
+            PROFILE_OK.replace("enabled = false", "enabled = true")
+                      .replace("dry_run = true", "dry_run = false"),
+            encoding="utf-8")
+        with self.assertRaises(ConfigError):
+            S.record_drill(full_drill())
 
     def test_incomplete_drill_rejected(self):
+        rid = S.start_drill()
+        self._evidence(rid)
         for key in S.DRILL_CHECKS:
             with self.subTest(key=key):
                 with self.assertRaises(ConfigError):
                     S.record_drill(full_drill(**{key: False}))
+
+    def test_run_id_mismatch_rejected(self):
+        rid = S.start_drill()
+        self._evidence(rid)
+        with self.assertRaises(ConfigError):
+            S.record_drill(full_drill(run_id="deadbeef"))
+
+
+class TestPrerequisitesForDrill(unittest.TestCase):
+    def setUp(self):
+        self.dir = sandbox(self)
+
+    def test_drill_requires_mcp_first(self):
+        """没做只读验证就记演练 —— 顺序必须被强制,不只是被展示。"""
+        with self.assertRaises(ConfigError) as cm:
+            S.record_drill(full_drill())
+        self.assertIn("前置步骤", str(cm.exception))
+
+
+class TestAccountFingerprint(unittest.TestCase):
+    """★ 换了账户,之前的验证就必须失效。
+
+    对抗测试原文:先为尾号 2222 的账户记录验证,再把 profile 换成尾号 3333,
+    系统依然认为验证有效。只存后 4 位甚至连"尾号相同的另一个账户"都分不出来。
+    """
+
+    def setUp(self):
+        self.dir = sandbox(self)
+
+    def test_fingerprint_is_not_reversible_to_account_id(self):
+        acct = "555000111"                                   # privacy-allow
+        fp = S.account_fingerprint(acct)
+        self.assertNotIn(acct, fp)
+        self.assertEqual(len(fp), 64)
+
+    def test_same_account_same_fingerprint(self):
+        self.assertEqual(S.account_fingerprint("555000111"),  # privacy-allow
+                         S.account_fingerprint("555000111"))  # privacy-allow
+
+    def test_changing_account_invalidates_mcp_verification(self):
+        S.record_mcp(full_mcp())
+        self.assertTrue(S.check_mcp(S._load_state()).ok)
+
+        (S.CONFIG_DIR / "profile.toml").write_text(
+            PROFILE_OK.replace("555000111", "555000222"),     # privacy-allow
+            encoding="utf-8")
+        step = S.check_mcp(S._load_state())
+        self.assertFalse(step.ok)
+        self.assertIn("失效", step.detail)
+
+    def test_changing_account_invalidates_drill(self):
+        stub_prereqs(self)
+        rid = S.start_drill()
+        S.DRILL_LOG.write_text(json.dumps({"run_id": rid, "verdict": "DRY_RUN"}) + "\n",
+                               encoding="utf-8")
+        S.record_drill(full_drill())
+        self.assertTrue(S.check_automation(S._load_state()).ok)
+
+        (S.CONFIG_DIR / "profile.toml").write_text(
+            PROFILE_OK.replace("555000111", "555000222"),     # privacy-allow
+            encoding="utf-8")
+        self.assertFalse(S.check_automation(S._load_state()).ok)
+
+
+class TestExecutionValidation(unittest.TestCase):
+    """存在 ≠ 合法。一个负数上限等于没有上限。"""
+
+    def _cfg(self, **over):
+        ex = {"max_order_usd": 80, "max_daily_usd": 200, "max_orders_per_day": 6,
+              "kill_switch_file": "data/HALTED", "live_mode": "guarded"}
+        ex.update(over)
+        return {"execution": ex}
+
+    def test_valid_config_passes(self):
+        self.assertEqual(S.validate_execution(self._cfg()), [])
+
+    def test_negative_amount_rejected(self):
+        self.assertTrue(S.validate_execution(self._cfg(max_order_usd=-1)))
+
+    def test_zero_order_count_rejected(self):
+        self.assertTrue(S.validate_execution(self._cfg(max_orders_per_day=0)))
+
+    def test_non_numeric_cap_rejected(self):
+        self.assertTrue(S.validate_execution(self._cfg(max_daily_usd="200")))
+
+    def test_bool_is_not_a_number(self):
+        self.assertTrue(S.validate_execution(self._cfg(max_order_usd=True)))
+
+    def test_scale_above_one_rejected(self):
+        self.assertTrue(S.validate_execution(self._cfg(size_scale_supported=1.5)))
+
+    def test_invalid_live_mode_rejected(self):
+        self.assertTrue(S.validate_execution(self._cfg(live_mode="invalid")))
+
+    def test_kill_switch_outside_repo_rejected(self):
+        self.assertTrue(S.validate_execution(self._cfg(kill_switch_file="../HALTED")))
+        self.assertTrue(S.validate_execution(self._cfg(kill_switch_file="/tmp/HALTED")))
+
+
+class TestAtomicStateWrite(unittest.TestCase):
+    def setUp(self):
+        self.dir = sandbox(self)
+
+    def test_state_write_leaves_no_partial_file(self):
+        S._save_state({"a": 1})
+        self.assertEqual(json.loads(S.STATE_FILE.read_text())["a"], 1)
+        self.assertFalse(list(S.DATA_DIR.glob("*.tmp")))
+
+    def test_corrupt_state_does_not_crash(self):
+        S.STATE_FILE.write_text("{ broken", encoding="utf-8")
+        self.assertEqual(S._load_state(), {})
+
+
+class TestAuthorizeWriteVerification(unittest.TestCase):
+    """★ 不能"提示成功但实际没开"。"""
+
+    def setUp(self):
+        self.dir = sandbox(self)
+        steps = [S.Step(s, True, "stub") for s in S.ORDER]
+        saved = S.evaluate
+        S.evaluate = lambda: (steps, S.ORDER[-1])
+        self.addCleanup(lambda: setattr(S, "evaluate", saved))
+
+    def _ex(self):
+        import tomllib
+        with (S.CONFIG_DIR / "profile.toml").open("rb") as fh:
+            return tomllib.load(fh)["execution"]
+
+    def test_fields_are_updated(self):
+        S.authorize_live("guarded")
+        ex = self._ex()
+        self.assertEqual((ex["enabled"], ex["dry_run"], ex["live_mode"]),
+                         (True, False, "guarded"))
+
+    def test_missing_fields_are_inserted_not_silently_skipped(self):
+        """对抗测试原文:profile 缺 enabled/dry_run 时,正则替换命中零次,却报成功。"""
+        (S.CONFIG_DIR / "profile.toml").write_text(
+            '[account]\nid = "555000111"\n\n[execution]\n'      # privacy-allow
+            'max_order_usd = 80\n', encoding="utf-8")
+        S.authorize_live("autonomous")
+        ex = self._ex()
+        self.assertEqual((ex["enabled"], ex["dry_run"], ex["live_mode"]),
+                         (True, False, "autonomous"))
+        self.assertEqual(ex["max_order_usd"], 80)
+
+    def test_result_is_read_back_and_verified(self):
+        S.authorize_live("guarded")
+        self.assertTrue(S.check_live().ok)
 
 
 class TestAuthorizationGating(unittest.TestCase):

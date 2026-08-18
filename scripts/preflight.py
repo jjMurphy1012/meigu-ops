@@ -60,6 +60,8 @@ ALLOW, DRY_RUN, DENY = "ALLOW", "DRY_RUN", "DENY"
 GATE_NAMES = (
     "紧急停止开关",
     "下单授权",
+    "接入状态",
+    "配置合法性",
     "账户身份",
     "市场时段",
     "意图时效",
@@ -76,6 +78,9 @@ GATE_NAMES = (
     "单日累计",
     "单日笔数",
     "同标的当日重复",
+    "持仓股数",
+    "清仓证据",
+    "台账可读",
     "ref_id",
 )
 
@@ -136,7 +141,76 @@ def validate_order(order: dict) -> list[str]:
     return errs
 
 
+def is_live(cfg: dict) -> bool:
+    """这一单会真的提交到券商吗?"""
+    ex = cfg.get("execution", {})
+    return bool(ex.get("enabled")) and not bool(ex.get("dry_run", True))
+
+
+def is_emergency_exit(order: dict) -> bool:
+    """紧急清仓通道:降低风险的完整退出。
+
+    只认 `side=sell` + `intent=close`。这条通道会豁免笔数与同标的重复限制 ——
+    **风控不能变成"进得去出不来"**。但豁免的代价是必须拿出持仓证据
+    (见「清仓证据」闸门),否则任何一笔买单都能自称清仓来绕开上限。
+    """
+    return (str(order.get("side", "")).lower() == "sell"
+            and str(order.get("intent", "")).lower() == "close")
+
+
+def _setup_evaluate():
+    """读接入状态。抽成函数是为了让测试能替换掉它。"""
+    from setup import evaluate
+
+    return evaluate()
+
+
 # ----------------------------------------------------------------------- 各闸门
+def check_setup_state(r: Result, cfg: dict) -> None:
+    """★ 把首次接入状态机接到下单路径上。
+
+    没有这道闸门,状态机只是个提示系统:它能告诉你"你跳过了只读验证和演练",
+    却拦不住下一笔真单。而 `[execution]` 是一个可以手改的 TOML —— 靠
+    `--authorize-live` 时检查一次是不够的,旧配置、手改、复制别人的配置
+    都能绕过那一次检查。**所以要在每一笔真单进闸门时重新验一遍。**
+
+    dry_run 不受此限:演练本身就是第 5 步,要求它先完成第 5 步是死循环。
+    """
+    if not is_live(cfg):
+        r.add("接入状态", True, "非真钱模式 —— 接入状态不作为闸门", fatal=False)
+        return
+    try:
+        steps, _ = _setup_evaluate()
+    except Exception as exc:                      # noqa: BLE001
+        r.add("接入状态", False, f"无法评估接入状态:{exc}",
+              hint="真钱模式必须 fail-closed。跑 `make setup` 看问题出在哪。")
+        return
+    bad = [s for s in steps if not s.ok]
+    r.add(
+        "接入状态",
+        not bad,
+        "六步全部就绪" if not bad else
+        "未完成:" + "、".join(f"{s.state}({s.detail})" for s in bad),
+        hint="真钱下单要求接入状态机六步全部通过 —— 跑 `make setup` 按提示补齐。"
+        if bad else "",
+    )
+
+
+def check_config_valid(r: Result, cfg: dict) -> None:
+    """执行参数的取值校验 —— 一个负数上限等于没有上限。"""
+    try:
+        from setup import validate_execution
+
+        errs = validate_execution(cfg)
+    except Exception as exc:                      # noqa: BLE001
+        r.add("配置合法性", False, f"无法校验 execution 配置:{exc}")
+        return
+    r.add("配置合法性", not errs,
+          "execution 参数取值合法" if not errs else ";".join(errs),
+          hint="修好 config/profile.toml 再下单 —— 非法上限会在运行时静默变成没有上限。"
+          if errs else "")
+
+
 def check_kill_switch(r: Result, cfg: dict) -> None:
     path = ROOT / cfg.get("execution", {}).get("kill_switch_file", "data/HALTED")
     exists = path.exists()
@@ -167,12 +241,13 @@ def check_account(r: Result, cfg: dict, order: dict) -> None:
     configured = str(cfg.get("account", {}).get("id", "")).strip()
     supplied = str(order.get("account_id", "")).strip()
     if not supplied:
+        # ★ 曾经只是警告 —— 但"无法核实"和"核实通过"绝不是一回事:
+        # 下错子账户是不可撤销的,而这道闸门是唯一能挡住它的地方。
         r.add(
             "账户身份",
             False,
             "订单未带 account_id —— 无法核实是否下在正确的子账户",
-            fatal=False,
-            hint="建议在订单里带上 account_id,让 preflight 能挡住下错账户。",
+            hint="在订单里带上 account_id。核实不了就不许下,不是给个警告放行。",
         )
         return
     match = bool(configured) and supplied == configured
@@ -334,6 +409,28 @@ def check_size(r: Result, cfg: dict, order: dict) -> None:
     if amount <= 0:
         r.add("金额为正", False, f"金额必须 > 0,实际 {amount}")
 
+    # --- 持仓股数:卖出不得超过实际持有
+    # 金额口径能被价格抵消(持 1 股、报价算低了,金额就可能仍在上限内),
+    # 所以股数必须单独比一次。
+    if side == "sell":
+        held = (order.get("position") or {}).get("qty")
+        want = order.get("qty")
+        if held is not None and want is not None:
+            held_f, want_f = float(held), float(want)
+            r.add("持仓股数", want_f <= held_f + 1e-9,
+                  f"拟卖 {want_f:g} 股 / 实际持有 {held_f:g} 股",
+                  hint="卖出股数超过持仓 —— 现金账户会直接拒单或形成裸空。"
+                  if want_f > held_f else "")
+
+    if is_emergency_exit(order):
+        pos = order.get("position") or {}
+        has_evidence = pos.get("market_value") is not None or pos.get("qty") is not None
+        r.add("清仓证据", has_evidence,
+              "已提供持仓数据" if has_evidence else "声明 intent=close 但没有提供 position 数据",
+              hint="紧急清仓通道会豁免笔数与同标的重复限制 —— 豁免必须有持仓证据支撑,"
+                   "否则任何单子都能自称清仓来绕开上限。"
+              if not has_evidence else "")
+
     # --- 减仓占比:2026-07-29 就是在这一步失守(实际卖出 91%)
     position = order.get("position") or {}
     mv = position.get("market_value")
@@ -380,7 +477,16 @@ def check_concentration_and_bp(r: Result, cfg: dict, order: dict) -> None:
     equity = pf.get("equity_value")
     total = pf.get("total_value")
 
-    if bp is not None:
+    if bp is None:
+        # ★ 曾经是"没数据就跳过这道闸门" —— 那等于把最容易缺的字段变成免检通道。
+        # 买入是新增风险,买力未知时不能假设够用。
+        r.add(
+            "买力充足",
+            False,
+            "订单未提供 portfolio.buying_power —— 无法确认买力是否足够",
+            hint="买单必须带上 get_portfolio 读到的 buying_power。缺数据一律 fail-closed。",
+        )
+    else:
         bp = float(bp)
         r.add(
             "买力充足",
@@ -462,7 +568,21 @@ def check_evidence_size(r: Result, cfg: dict, order: dict) -> None:
     cap = float(ex.get("max_order_usd", 80))
 
     primary = str(order.get("primary_rule_id", "") or "")
-    context = [str(x) for x in (order.get("context_rule_ids") or order.get("rule_ids") or [])]
+    context = [str(x) for x in (order.get("context_rule_ids") or [])]
+
+    # ★ 契约统一:订单里只认 primary_rule_id + context_rule_ids。
+    # 旧字段 `rule_ids` 曾被文档要求、却不被本函数识别 —— 结果是"我明明写了依据",
+    # 系统却按"未声明"给 40% 尺寸,而且不报错。静默降档比报错难查得多。
+    legacy = order.get("rule_ids")
+    if legacy and not primary:
+        r.add(
+            "证据尺寸",
+            False,
+            f"订单用了旧字段 rule_ids={legacy} —— 本闸门只认 primary_rule_id",
+            hint="改成 primary_rule_id(本笔主要依据的**一条**规则)"
+                 " + context_rule_ids(其余依据)。一条规则决定尺寸,不取 max。",
+        )
+        return
 
     if not primary:
         allowed = cap * observe_scale
@@ -510,10 +630,14 @@ def check_evidence_size(r: Result, cfg: dict, order: dict) -> None:
     scale, why = rule_size_tier(rule, ex)
     # guarded_live:刚开真钱的阶段,仓位统一压到最低档,不管规则状态多好。
     # 这样"开了真钱"和"放开仓位"是两个独立决定,可以先只做前一个。
-    if str(ex.get("live_mode", "guarded")) == "guarded":
+    # 未知值按 guarded 处理:只判断"是不是 autonomous"而不是"是不是 guarded",
+    # 否则 live_mode = "invalid" 会落进宽松分支拿到满尺寸(fail-open)。
+    # 非法值本身会被「配置合法性」闸门拦下,这里是第二道。
+    mode = str(ex.get("live_mode", "guarded"))
+    if mode != "autonomous":
         capped = min(scale, observe_scale)
         if capped < scale:
-            why += f" · live_mode=guarded 压到 ×{capped:g}"
+            why += f" · live_mode={mode} 压到 ×{capped:g}"
         scale = capped
     if scale == 0.0:
         r.add("证据尺寸", False, f"主依据已停用:{why}",
@@ -571,10 +695,16 @@ def check_daily_limits(r: Result, cfg: dict, order: dict) -> None:
         )
 
     cap_n = int(ex.get("max_orders_per_day", 6))
+    emergency = is_emergency_exit(order)
+    over_n = len(today) + 1 > cap_n
     r.add(
         "单日笔数",
-        len(today) + 1 <= cap_n,
-        f"今日已 {len(today)} 笔 + 本笔 = {len(today) + 1} / 上限 {cap_n}",
+        (not over_n) or emergency,
+        f"今日已 {len(today)} 笔 + 本笔 = {len(today) + 1} / 上限 {cap_n}"
+        + ("(紧急清仓豁免)" if over_n and emergency else ""),
+        fatal=not emergency,
+        hint="笔数上限挡不住降低风险的清仓 —— 但仍受账户身份与持仓证据约束。"
+        if over_n and emergency else "",
     )
 
     # --- 同一标的当日不重复操作
@@ -582,11 +712,13 @@ def check_daily_limits(r: Result, cfg: dict, order: dict) -> None:
     dup = [o for o in today if str(o.get("symbol", "")).upper() == sym]
     r.add(
         "同标的当日重复",
-        not dup,
-        f"{sym} 今日已有 {len(dup)} 笔操作" if dup else f"{sym} 今日尚无操作",
-        hint="同一标的当日不重复操作是硬规则。若用户明确要求追加,需人工确认覆盖。"
-        if dup
-        else "",
+        (not dup) or emergency,
+        (f"{sym} 今日已有 {len(dup)} 笔操作" + ("(紧急清仓豁免)" if emergency else ""))
+        if dup else f"{sym} 今日尚无操作",
+        fatal=not emergency,
+        hint="同一标的当日不重复操作是硬规则。"
+             "唯一例外是 intent=close 的清仓 —— 早上加过仓不该导致下午无法离场。"
+        if dup else "",
     )
 
 
@@ -613,12 +745,16 @@ def check_ref_id(r: Result, order: dict) -> None:
 
     seen_in_ledger = False
     try:
-        for t in parse_trades():
-            if ref.lower() in (t.note or "").lower():
+        for row in parse_trades():
+            if ref.lower() in (row.note or "").lower():
                 seen_in_ledger = True
                 break
-    except LedgerError:
-        pass  # 台账格式问题由 stats/doctor 报,这里不重复报
+    except LedgerError as exc:
+        # ★ 曾经是 `pass` —— 台账读不出来,去重就等于没做,而订单照样放行。
+        # 幂等保护失效时最坏的后果是重复下单,所以这里必须 fail-closed。
+        r.add("台账可读", False, f"台账无法解析,ref_id 去重不可用:{exc}",
+              hint="先跑 `make stats` 或 `make doctor` 修好 data/trades.tsv 再下单。")
+        return
 
     r.add(
         "ref_id 未重复",
@@ -637,6 +773,8 @@ def run(order: dict, cfg: dict, now: dt.datetime | None = None, vocab=None) -> R
 
     check_kill_switch(r, cfg)
     check_execution_enabled(r, cfg)
+    check_config_valid(r, cfg)
+    check_setup_state(r, cfg)
     check_account(r, cfg, order)
     check_market_session(r, cfg, order, now)
     check_intent_freshness(r, cfg, order, now)
@@ -684,6 +822,36 @@ def print_report(r: Result, cfg: dict, order: dict) -> None:
         print(f"\n⚠️  {len(r.warnings)} 项提醒(不阻断,但要在汇报里说明)。")
 
 
+def write_drill_evidence(order: dict, r: Result) -> None:
+    """把本次判定写进演练证据日志。
+
+    ★ 为什么需要它:`--record-drill` 原本只接受 agent 自报的六个布尔值,
+    也就是**让被检查方出具检查结论**。证据行只有真的跑过闸门才会出现,
+    run id 由 `setup.py --start-drill` 生成,agent 编不出来。
+
+    写失败不阻断下单 —— 记录演练是次要目的,拦截坏单才是主要目的。
+    """
+    run_id = str(order.get("drill_run_id", "") or "").strip()
+    if not run_id:
+        return
+    try:
+        from setup import DRILL_LOG
+
+        DRILL_LOG.parent.mkdir(parents=True, exist_ok=True)
+        rec = {
+            "run_id": run_id,
+            "at": now_et().strftime("%Y-%m-%d %H:%M:%S ET"),
+            "symbol": str(order.get("symbol", "")),
+            "side": str(order.get("side", "")),
+            "verdict": r.verdict,
+            "blockers": [c.name for c in r.blockers],
+        }
+        with DRILL_LOG.open("a", encoding="utf-8") as fh:
+            fh.write(json.dumps(rec, ensure_ascii=False) + "\n")
+    except Exception:                             # noqa: BLE001
+        pass
+
+
 def main(argv: list[str] | None = None) -> int:
     ap = argparse.ArgumentParser(description="下单前置确定性检查")
     # 注意:输入源不能放进 required=True 的互斥组 —— 那样 `--example` 单独用会被
@@ -728,6 +896,7 @@ def main(argv: list[str] | None = None) -> int:
 
     vocab = load_vocabulary(path=Path(args.tags)) if args.tags else None
     r = run(order, cfg, now, vocab=vocab)
+    write_drill_evidence(order, r)
 
     if args.json:
         print(json.dumps(
@@ -769,6 +938,11 @@ EXAMPLE_ORDER = {
     "portfolio": {"total_value": 500.0, "buying_power": 90.0,
                   "cash": 90.0, "equity_value": 410.0},
     "today_orders": [],
+    # 买入时必填:本笔主要依据的那一条市场判断类规则(只有它决定尺寸)。
+    # 其余依据放 "context_rule_ids": [...]。旧字段 rule_ids 已不再被识别。
+    "primary_rule_id": None,
+    # 演练时填 `setup.py --start-drill` 给的 run id,preflight 会据此写下证据。
+    "drill_run_id": None,
 }
 
 

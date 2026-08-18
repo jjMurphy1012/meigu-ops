@@ -132,10 +132,17 @@ cp modes/_strategy.example.md       modes/_strategy.md
 
 ## Step 5 · AUTOMATION_READY — dry-run 端到端演练
 
-确认 `dry_run = true`,然后完整跑一遍:
+确认 `dry_run = true`,先**开一次演练**拿到 run id:
 
-盘前(`premarket`)→ 盘中(`check`)→ `preflight` → 模拟下单(走完 `review`,
-**不 `place`**)→ 尾盘日志与台账(`journal`)→ 复盘审计(`review`)。
+```bash
+python3 scripts/setup.py --start-drill      # 打印 run id
+```
+
+然后完整跑一遍:盘前(`premarket`)→ 盘中(`check`)→ `preflight` → 模拟下单
+(走完 `review`,**不 `place`**)→ 尾盘日志与台账(`journal`)→ 复盘审计(`review`)。
+
+**跑 preflight 时在订单 JSON 里加 `"drill_run_id": "<run id>"`** ——
+preflight 会把判定写进 `data/drill-runs.jsonl`,那才是演练真的发生过的证据。
 
 跑通后写回:
 
@@ -148,6 +155,10 @@ python3 scripts/setup.py --record-drill --stdin <<'JSON'
 }
 JSON
 ```
+
+**六个布尔值不足以记成完成。** 脚本还会核对:前三步确实就绪、当前确实处于
+dry_run、以及**存在判定为 `DRY_RUN` 的 preflight 证据行**。
+让被检查方自己出具检查结论,等于没有检查 —— 所以证据由闸门写,不由 agent 报。
 
 演练的意义是把"配置对不对"和"链路通不通"分开验证。链路没跑通就开真钱,
 出问题时你分不清是策略错了还是管道漏了。

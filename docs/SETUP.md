@@ -123,13 +123,19 @@ make rules-check     # 格式、标签引用、闸门引用
 
 ```bash
 make doctor          # 应该只剩防休眠类的提醒
-make test            # 295 个测试应全绿
+make test            # 334 个测试应全绿
 make trading-day     # 今天是不是交易日
 make report          # 生成 reports/{今天}.md 骨架
 ```
 
+```bash
+python3 scripts/setup.py --start-drill    # 拿 run id
+```
+
 确认 `dry_run = true`,然后完整跑一遍:盘前 → 盘中 → preflight → 模拟下单
 (走完 `review`,**不 `place`**)→ 尾盘日志 → 复盘。
+跑 preflight 时在订单里带上 `"drill_run_id"`,判定会被写进 `data/drill-runs.jsonl` ——
+`--record-drill` 只认这些证据,不认自报的布尔值。
 
 演练的意义是把"配置对不对"和"链路通不通"分开验证。**链路没跑通就开真钱,
 出问题时你分不清是策略错了还是管道漏了。**
@@ -244,7 +250,11 @@ python3 scripts/setup.py --authorize-live guarded --approved
 python3 scripts/setup.py --authorize-live autonomous --approved
 ```
 
-不带 `--approved` 会直接退出;前五步没全过也会被拒绝。
+不带 `--approved` 会直接退出;前五步没全过也会被拒绝。写入会**回读校验** ——
+值没真的落盘就不会报成功。
+
+而且这不是一次性检查:**每一笔真单进 `preflight` 时都会重新验一遍六步状态**。
+`[execution]` 是个可以手改的 TOML,只在授权那一刻检查是拦不住手改和旧配置的。
 
 **"开不开真钱"与"放不放开仓位"是两个独立决定。** 不要一次做完。
 

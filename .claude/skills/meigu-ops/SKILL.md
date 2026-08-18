@@ -142,6 +142,7 @@ make check-privacy   # 提交前隐私检查
 **下单必经 `preflight`。** 它返回 `DENY` 就是不许下,不得绕过或"人工判断通过"
 (详见 `modes/trade.md` Step 1)。
 
-**订单要写 `rule_ids`** —— 本笔依据了 `config/rules.toml` 的哪几条规则。
+**订单要写 `primary_rule_id`**(本笔主要依据的**一条**市场判断类规则)
++ `context_rule_ids`(其余依据)。旧字段 `rule_ids` 会被 DENY,不再静默降档。
 尺寸随证据强度自动缩放:未声明或依据仍在观察期按最低档,依据已被数据支持的规则可满额。
 超限时 preflight 会直接给出允许金额,按那个数重下即可 —— **不需要人工换算**。

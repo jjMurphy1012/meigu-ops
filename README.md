@@ -12,7 +12,7 @@
 <p align="center">
   <img src="https://img.shields.io/badge/Python-3.11+-3776AB?style=flat&logo=python&logoColor=white" alt="Python 3.11+">
   <img src="https://img.shields.io/badge/dependencies-none-2ea44f?style=flat" alt="Zero dependencies">
-  <img src="https://img.shields.io/badge/tests-295%20passing-2ea44f?style=flat" alt="295 tests">
+  <img src="https://img.shields.io/badge/tests-334%20passing-2ea44f?style=flat" alt="334 tests">
   <a href="https://claude.com/claude-code"><img src="https://img.shields.io/badge/Built_with-Claude_Code-000?style=flat&logo=anthropic&logoColor=white" alt="Built with Claude Code"></a>
   <img src="https://img.shields.io/badge/License-MIT-blue.svg" alt="MIT">
   <a href="DISCLAIMER.md"><img src="https://img.shields.io/badge/%E2%9A%A0%EF%B8%8F-%E4%B8%8D%E6%9E%84%E6%88%90%E6%8A%95%E8%B5%84%E5%BB%BA%E8%AE%AE-critical" alt="Not investment advice"></a>
@@ -56,8 +56,8 @@
 先砍最弱的一环、在已知的二元事件前把现金提上来——我把损失控制在个位数百分比，
 同期我持仓所在的板块指数跌了 7% 以上。
 
-**问题是那几条纪律只存在于我脑子里。** 而脑子会忘、会侥幸、会在连续第 20 天
-盯盘之后变得懈怠。更糟的是，一个月后我自己复盘时发现了相反的毛病：
+**问题是那几条纪律只存在于我脑子里。** 而脑子会忘、会侥幸、
+会在连续多天盯盘之后变得懈怠。更糟的是，一个月后我自己复盘时发现了相反的毛病：
 同一套"谨慎"让我在该出手的时候反复等待，现金长期空转——
 那笔亏损同样真实，只是它不出现在盈亏表里。
 
@@ -65,8 +65,8 @@
 而在于我没有任何机制去知道它们对不对。**
 
 于是有了这个项目。它把纪律从脑子里搬进文件，把机械的检查从自觉搬进程序，
-最后——也是最花时间的一部分——把"这条规则到底成不成立"变成一个能被台账数据
-回答的问题，而不是一个凭印象争论的问题。
+最后——也是最花时间的一部分——把"这条规则到底成不成立"
+变成一个能被台账数据回答的问题，而不是一个凭印象争论的问题。
 
 > 你在这个仓库里找不到我的那几条纪律。它们对你没有意义，
 > 而且我自己也在不断修正它们。**留下的是那套让纪律能被检验、能被推翻的机制。**
@@ -123,9 +123,9 @@ make setup        # ★ 从这里开始
 
 **顺序是刻意的:连接要早、只读;授权要晚、单独。**
 
-把连券商放在最后,你会配置半天才发现账户或权限根本不可用 —— 那时 MCP 的问题
-和项目配置的问题已经混在一起。但**连接成功不等于获得下单权限**:第 2 步全程
-只读,连 `place_equity_order` 都不会被调用。
+把连券商放在最后,你会配置半天才发现账户或权限根本不可用 ——
+那时 MCP 的问题和项目配置的问题已经混在一起。但**连接成功不等于获得下单权限**:
+第 2 步全程只读,连 `place_equity_order` 都不会被调用。
 
 第 4 步是这个项目的重点。`modes/_strategy.example.md` 里全是问题、没有答案 ——
 那些答案必须由你自己写。起步建议:**先只写 2–3 条你最相信的规则**。
@@ -159,8 +159,22 @@ python3 scripts/stats.py --demo
 把 `config/profile.toml` 的 `[execution]` 三个开关打开，意味着：
 
 ✅ **agent 在一次运行中可以真的下单**，无需逐笔确认
-✅ 每笔仍必经 `preflight`，四条硬上限与 kill switch 无条件生效
+✅ 每笔仍必经 `preflight`，且必须先通过接入状态机的六步
 ✅ 仓位按证据强度自动缩放，无需人工换算
+
+上限的**准确**口径（别信"四条无条件"这种省略说法）：
+
+| 约束 | 买入 | 卖出 |
+|---|---|---|
+| kill switch | 无条件 | 无条件 |
+| 账户身份 | 无条件 | 无条件 |
+| 单笔金额上限 | 无条件 | 由**持仓市值**封顶(+2%)，不受单笔上限约束 |
+| 单日累计金额 | 无条件 | 不适用 |
+| 单日笔数 | 无条件 | `intent=close` 的清仓可豁免，但必须提供持仓证据 |
+| 同标的当日重复 | 无条件 | 同上 |
+
+**卖出的豁免是刻意的**：风控如果能阻止你降低风险，它就不是风控。
+但每一条豁免都要求拿出持仓数据——豁免有代价，才不会被当成后门。
 
 **它不意味着以下任何一条**（这些是当前的真实缺口）：
 
@@ -221,8 +235,8 @@ python3 scripts/stats.py --demo
 
 ## ⚠️ 免责
 
-**本项目不构成投资建议。** 它是个人研究与流程工具,不预测市场,不推荐任何证券的
-买卖或持有。仓库内出现的所有代码、价位、标签均为结构示例或占位,`examples/` 与
+**本项目不构成投资建议。** 它是个人研究与流程工具,不预测市场,
+不推荐任何证券的买卖或持有。仓库内出现的所有代码、价位、标签均为结构示例或占位,`examples/` 与
 `demo/` 中的全部数字为虚构。
 
 **本项目可以自动向券商提交真实订单。** 启用前请自行确认 API 权限、订单类型、
