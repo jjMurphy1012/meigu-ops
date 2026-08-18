@@ -1,0 +1,23 @@
+# 示例规则 —— 演示与测试固件
+#
+# ⚠️ 下面这条 market 规则是**占位假设**,用来演示审计机制怎么运转。
+#    它不是推荐的策略,标签也是 A/B 占位。真规则在 config/rules.toml,由你自己写。
+
+[[rule]]
+id        = "example-a-vs-b"
+statement = "【占位假设】减仓A 这类退出决策的均笔实现盈亏优于 减仓B"
+kind      = "market"
+test      = { type = "tag_compare", better = ["减仓A"], worse = ["减仓B", "清仓"] }
+status    = "hypothesis"
+execution_scope = "observe"
+evidence  = ["【占位】这里应写下让你确立这条假设的真实交易"]
+last_audited = ""
+
+[[rule]]
+id        = "example-size-check"
+statement = "减仓前必须先算这笔金额占该仓位当前市值的百分比"
+kind      = "process"
+test      = { type = "enforced_by", by = "preflight:减仓占比" }
+status    = "enforced"
+evidence  = ["标准尺寸相对'正常仓位'设计;仓位缩水后同样金额的占比会远超预期"]
+last_audited = ""

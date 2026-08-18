@@ -1,0 +1,77 @@
+name: test
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        # 3.11 是下限(tomllib 进标准库的版本);3.13 是当前开发环境。
+        python-version: ["3.11", "3.13"]
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python-version }}
+
+      - name: 确认零第三方依赖
+        run: |
+          if [ -f requirements.txt ] || [ -f pyproject.toml ]; then
+            echo "::error::本项目应保持零第三方依赖(仅标准库)。"
+            exit 1
+          fi
+          echo "✅ 无依赖清单文件"
+
+      - name: 语法检查
+        run: python -m compileall -q scripts tests
+
+      - name: 单元测试
+        run: PYTHONPATH=scripts python -m unittest discover -s tests -v
+
+      - name: 脚本冒烟测试
+        run: |
+          python scripts/trading_day.py 2026-08-18
+          python scripts/trading_day.py --year 2026
+          # 必须用 --demo:它同时指定台账**与词表**。
+          # 只给 --file 会落回环境里的词表 —— 演示固件不该依赖环境配置。
+          python scripts/stats.py --demo
+          python scripts/stats.py --demo --json > /dev/null
+          python scripts/rules.py --file config/rules.example.toml
+          python scripts/preflight.py --example > /dev/null
+          for tab in 组合 台账 纪律; do
+            python scripts/dashboard.py --demo --render "$tab" --width 100 --height 30 > /dev/null
+          done
+          echo '{"portfolio":{"total":1}}' | python scripts/snapshot.py --stdin --checkpoint ci
+          python scripts/snapshot.py --list
+
+      - name: 演示固件必须自洽(台账 / 词表 / 规则三者对得上)
+        run: |
+          python - <<'PY'
+          import sys
+          from pathlib import Path
+          sys.path.insert(0, "scripts")
+          from meigu_lib import load_vocabulary, parse_trades
+          from rules import load_rules
+
+          vocab = load_vocabulary(path=Path("examples/sample-reason-tags.toml"))
+          trades = parse_trades(Path("examples/sample-trades.tsv"), vocab=vocab)
+          assert trades, "examples/sample-trades.tsv 解析结果为空"
+
+          rules, _, _ = load_rules(path=Path("examples/sample-rules.toml"), vocab=vocab)
+          assert rules, "examples/sample-rules.toml 为空"
+          # 演示里的 market 规则必须是 observe —— 示范正确的默认姿态
+          for r in rules:
+              if r.kind == "market":
+                  assert not r.may_authorize_live, f"{r.id} 不该是 live"
+          print(f"✅ 演示固件自洽:{len(trades)} 行台账 / {len(vocab.all)} 个标签 / {len(rules)} 条规则")
+          PY

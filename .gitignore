@@ -1,0 +1,92 @@
+# ============================================================
+#  用户层(user layer)—— 永不进仓
+#  本项目的开源边界:仓库里只有"怎么做"(方法论/模板/脚本),
+#  不含"做了什么"(真实账户、持仓、交易记录、盈亏)。
+#  边界的完整定义见 docs/DATA_CONTRACT.md。
+# ============================================================
+
+# --- 真实配置:账户号、仓位参数、下单授权、关注股、标签词表、纪律规则 ---
+# 用通配而非逐个后缀:曾因这里写 .yml 而项目实际用 .toml,
+# 真实配置整整一版没有被忽略。tests/test_gitignore.py 现在会断言这些路径真的被忽略。
+#
+# ★ reason-tags 与 rules 也在这里:**怎么细分交易理由、相信哪些规则,就是策略本身**。
+#   仓库只提供 *.example.* 模板(问题与结构),不提供答案。
+config/profile.*
+config/watchlist.*
+config/reason-tags.*
+config/rules.*
+!config/*.example.*
+
+# --- 你的纪律手册正文(散文形式的策略)---
+modes/_strategy.md
+# 兜底:任何 config/ 下未来新增的真配置
+config/local.*
+config/secrets.*
+
+# --- 运行时数据:交易台账、日志、经验档案、快照 ---
+# 用 data/* 通配而非逐个文件名:以后新增任何生成物都自动被覆盖,
+# 不需要回来改 .gitignore。只放行 .gitkeep 占位。
+data/*
+!data/.gitkeep
+!data/snapshots/
+data/snapshots/*
+!data/snapshots/.gitkeep
+
+# --- 日报输出(含真实持仓和真实决策) ---
+reports/*
+!reports/.gitkeep
+
+# --- 券商/账户相关的兜底模式 ---
+# 任何带账户号形态或明显私密语义的文件都拦住,防误提交。
+#
+# ⚠️ 这类无锚点通配会误伤系统层文件:`*portfolio*` 曾把
+# examples/sample-portfolio.json(dashboard 的演示固件)一起吞掉 ——
+# 本地测试全绿,但干净 clone 缺文件,make dashboard-demo 直接跑不起来。
+# 所以下面显式放行 examples/ 与 demo/ 两个**只放虚构固件**的目录。
+*positions*
+*portfolio*
+*持仓*
+*对账*
+*statement*
+*.csv
+!examples/**
+!demo/**
+
+# ============================================================
+#  CLI 本地配置(常含个人 MCP 凭证 / 绝对路径 / 权限白名单)
+# ============================================================
+.claude/settings.local.json
+.claude/scheduled_tasks.lock
+.claude/memory/
+.mcp.json
+.env
+**/.env.local
+**/.env*.local
+
+# ============================================================
+#  归档与临时
+# ============================================================
+data/_archive/
+*.log
+*.bak*
+.tmp-*/
+plan/
+
+# ============================================================
+#  Python
+# ============================================================
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+.pytest_cache/
+.mypy_cache/
+.coverage
+htmlcov/
+
+# ============================================================
+#  OS / IDE
+# ============================================================
+.DS_Store
+.idea/
+.vscode/

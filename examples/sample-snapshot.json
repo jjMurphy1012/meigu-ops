@@ -1,0 +1,59 @@
+{
+  "_comment": [
+    "examples/sample-snapshot.json —— data/snapshots/YYYY-MM-DD.json 的格式示例。",
+    "⚠️ 下面所有数字均为虚构,仅用于演示 dashboard 与快照格式。",
+    "不代表任何真实持仓、真实盈亏或任何操作建议。",
+    "",
+    "dashboard 只读 checkpoints[*].normalized 这一块。",
+    "checkpoints[*].portfolio / positions / quotes 应原样存 MCP 返回值,",
+    "normalized 是给脚本用的、字段名固定的归一化视图。",
+    "字段规范见 docs/DATA_CONTRACT.md §4。"
+  ],
+  "date": "2026-08-18",
+  "weekday": "周二",
+  "day_info": "正常交易日",
+  "checkpoints": {
+    "10:33": {
+      "captured_at_et": "2026-08-18 10:33:41",
+      "normalized": {
+        "total_value": 512.4,
+        "cash": 92.8,
+        "buying_power": 92.8,
+        "equity_value": 419.6,
+        "positions": [
+          {"symbol": "AAAA",  "qty": 0.472,  "avg_cost": 398.5, "price": 430.2, "market_value": 203.06},
+          {"symbol": "BBBB", "qty": 0.610,  "avg_cost": 205.0, "price": 214.4, "market_value": 130.78},
+          {"symbol": "CCCC",  "qty": 0.735,  "avg_cost": 124.0, "price": 118.7, "market_value": 87.24}
+        ]
+      }
+    },
+    "13:03": {
+      "captured_at_et": "2026-08-18 13:03:12",
+      "normalized": {
+        "total_value": 515.9,
+        "cash": 92.8,
+        "buying_power": 92.8,
+        "equity_value": 423.1,
+        "positions": [
+          {"symbol": "AAAA",  "qty": 0.472,  "avg_cost": 398.5, "price": 434.9, "market_value": 205.27},
+          {"symbol": "BBBB", "qty": 0.610,  "avg_cost": 205.0, "price": 216.1, "market_value": 131.82},
+          {"symbol": "CCCC",  "qty": 0.735,  "avg_cost": 124.0, "price": 116.4, "market_value": 85.55}
+        ]
+      }
+    },
+    "15:37": {
+      "captured_at_et": "2026-08-18 15:37:05",
+      "normalized": {
+        "total_value": 518.2,
+        "cash": 92.8,
+        "buying_power": 92.8,
+        "equity_value": 425.4,
+        "positions": [
+          {"symbol": "AAAA",  "qty": 0.472,  "avg_cost": 398.5, "price": 438.0, "market_value": 206.74},
+          {"symbol": "BBBB", "qty": 0.610,  "avg_cost": 205.0, "price": 217.5, "market_value": 132.68},
+          {"symbol": "CCCC",  "qty": 0.735,  "avg_cost": 124.0, "price": 116.3, "market_value": 85.51}
+        ]
+      }
+    }
+  }
+}

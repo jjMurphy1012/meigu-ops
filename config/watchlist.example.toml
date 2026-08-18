@@ -1,0 +1,139 @@
+# meigu-ops 关注池与日报骨架配置
+#
+# 用法:cp config/watchlist.example.toml config/watchlist.toml
+# config/watchlist.toml 已被 gitignore —— 你关注什么是你的研究偏好,不进仓。
+#
+# ============================================================================
+# 这个文件决定日报长什么样
+# ============================================================================
+# `make report` 用下面的配置生成 reports/{日期}.md 的骨架:
+# 哪些指数、哪些板块、哪些主题、哪些技术面标的、哪些分组、哪些风险维度。
+#
+# **仓库不预设任何研究范围。** 通用大盘指标之外的部分(主题、分组、风险维度)
+# 都请按你自己的方式重写 —— 别人的研究切面对你没有意义。
+#
+# 别贪多:日报每天都要填。组太多会让它变成填表劳动,填不完就开始糊弄。
+# 建议分组 3-6 个、每组 5-12 只;主题 8-14 行;风险维度 5-8 项。
+# ============================================================================
+
+
+# ── §1 大盘表现总览 ──
+# 市场级指标,与你的策略无关,通常不用改。
+[[report.indices]]
+name = "Dow Jones"
+[[report.indices]]
+name = "S&P 500"
+[[report.indices]]
+name = "Nasdaq Composite"
+[[report.indices]]
+name = "Nasdaq 100 / QQQ"
+[[report.indices]]
+name = "Russell 2000 / IWM"
+[[report.indices]]
+name = "VIX"
+
+
+# ── §4 板块表现:标普官方十一板块,通常不用改 ──
+[[report.sectors]]
+name = "信息技术"
+etf  = "XLK"
+[[report.sectors]]
+name = "通信服务"
+etf  = "XLC"
+[[report.sectors]]
+name = "可选消费"
+etf  = "XLY"
+[[report.sectors]]
+name = "金融"
+etf  = "XLF"
+[[report.sectors]]
+name = "工业"
+etf  = "XLI"
+[[report.sectors]]
+name = "医疗保健"
+etf  = "XLV"
+[[report.sectors]]
+name = "必需消费"
+etf  = "XLP"
+[[report.sectors]]
+name = "能源"
+etf  = "XLE"
+[[report.sectors]]
+name = "公用事业"
+etf  = "XLU"
+[[report.sectors]]
+name = "材料"
+etf  = "XLB"
+[[report.sectors]]
+name = "房地产"
+etf  = "XLRE"
+
+
+# ── §5 主题与风格:★ 从这里开始是你的研究偏好,请重写 ──
+# 每行一个你实际会跟踪的切面。proxy 写代表 ETF,没有 ETF 就写"代表股观察"。
+[[report.themes]]
+name  = "示例主题一(换成你的)"
+proxy = "代表 ETF 或代表股"
+[[report.themes]]
+name  = "示例主题二(换成你的)"
+proxy = "代表 ETF 或代表股"
+[[report.themes]]
+name  = "小盘成长"
+proxy = "IWO"
+[[report.themes]]
+name  = "小盘价值"
+proxy = "IWN"
+[[report.themes]]
+name  = "等权标普"
+proxy = "RSP"
+[[report.themes]]
+name  = "大盘成长"
+proxy = "QQQ"
+[[report.themes]]
+name  = "大盘价值"
+proxy = "VTV"
+
+
+[report]
+# ── §7 技术面分析:你每天要看形态的标的 ──
+technicals = ["SPY", "QQQ", "IWM"]
+
+# ── §13.2 大盘观察:次日要盯的关键位 ──
+watch_levels = ["SPY 支撑 / 压力", "QQQ 支撑 / 压力", "IWM 是否参与"]
+
+# ── §14 风险维度:★ 按你实际承担的风险重写 ──
+# 每天给每个维度评一级(低 / 中 / 中高 / 高)。
+# 维度必须能被**当天的数据**判定 —— "市场情绪"这种事后才知道的不要写。
+risk_dimensions = [
+  "宏观利率",
+  "市场宽度",
+  "估值与拥挤度",
+  "财报风险",
+  "地缘风险",
+  "技术面",
+  "流动性",
+]
+
+
+[benchmarks]
+# 每次分析必拉的基准(盘前/盘中检查点用,不只日报)。
+# 选哪些、怎么解读由你的策略决定 —— 见 modes/_strategy.example.md。
+core = ["SPY", "QQQ", "IWM", "TLT", "VIX"]
+
+
+# ── §8 个股异动 与 §12 关注股观察:都用下面的分组 ──
+# ★ 全部换成你自己的。
+[[groups]]
+name = "示例分组一(换成你的)"
+symbols = ["AAPL", "MSFT", "AMZN"]
+
+[[groups]]
+name = "示例分组二(换成你的)"
+symbols = ["JPM", "XOM", "UNH"]
+
+
+[main_theme]
+# 你的主线偏好。盘前扫候选时会优先在这里找 —— 但"优先"不等于"只在这里找"。
+tags = ["示例主线一", "示例主线二"]
+# 你认为能提供真实分散的方向(不同驱动、不同 beta)。换成你自己的判断。
+diversifiers = []

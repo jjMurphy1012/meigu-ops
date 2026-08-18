@@ -1,0 +1,33 @@
+{
+  "_comment": [
+    "演示固件 —— 重放一种真实发生过的事故形态:",
+    "意图是「部分减仓、留大部分观察」,但该仓位已大跌到市值约等于一个标准尺寸,",
+    "仍按标准尺寸下单 → 实际卖出 90% 以上,变成近乎清仓。",
+    "",
+    "⚠️ 所有数字均为虚构,账户号为占位值。仅用于演示 preflight 闸门。",
+    "格式模板:python3 scripts/preflight.py --example"
+  ],
+  "account_id": "000000000",
+  "symbol": "DDDD",
+  "side": "sell",
+  "amount_usd": 30.0,
+  "order_type": "market",
+  "market_hours": "regular_hours",
+  "intent": "partial",
+  "reason_tag": "减仓B",
+  "ref_id": "9f8e7d6c-5b4a-4392-8271-0a1b2c3d4e5f",
+  "analysis_at_et": "2026-08-18 12:58",
+  "quote_timestamp_et": "2026-08-18 13:03",
+  "position": {
+    "market_value": 33.0,
+    "qty": 0.271,
+    "avg_cost": 152.4
+  },
+  "portfolio": {
+    "total_value": 518.2,
+    "buying_power": 92.8,
+    "cash": 92.8,
+    "equity_value": 425.4
+  },
+  "today_orders": []
+}

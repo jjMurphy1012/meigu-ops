@@ -1,0 +1,456 @@
+"""交易纪律规则的加载、校验与审计。
+
+规则住在 `config/rules.toml`(已 gitignore)—— **本仓库不提供交易策略**,
+它提供的是让你的策略能被台账数据检验、并因此不断修正的机制。
+
+真相源优先级
+============
+1. **`config/rules.toml` 是执行状态的唯一真相源。** 一条规则当前能不能指导下单,
+   只看这里的 `status` 与 `execution_scope`。
+2. `modes/_strategy.md` 提供解释、上下文与无法结构化的细节,**不决定执行状态**。
+3. `_strategy.md` 里引用规则要用稳定的 `rule.id`。
+4. 两者冲突时(例如 rules.toml 已 `refuted` 而散文仍要求执行)——
+   **停用该规则并提示用户修正**,不要自行猜哪边是对的。
+5. `make rules-check` 检查:缺失/重复 id、未知标签、未知闸门、散文未引用的规则。
+
+三种检验方式
+============
+    enforced_by   由程序强制(必须是注册表里真实存在的闸门)
+    tag_compare   比较若干标签的实现盈亏 → 结论方向 + 证据强度
+    manual        无法自动化,复盘时人工过
+
+三类规则(不要混淆)
+====================
+    invariant  不可关闭的系统安全不变量。无程序把守,靠流程保证。
+               **不应该被删除** —— 删掉它并不会让约束消失,只会让它不可见。
+    enforced   有程序把守(必须指向注册表里真实存在的闸门)。
+               删掉条目不会关闭闸门;要改行为得改 config 或代码。
+    market     可配置的风险政策与市场判断,由台账数据裁决状态。
+
+状态机(market 类,由 review 推进,**每次状态变更都需要用户批准**)
+==================================================================
+    hypothesis ──数据支持──► supported ──数据推翻──► refuted ──► retired
+        └──────────────数据推翻──────────────┘
+
+执行层级(与状态正交)
+=====================
+    live      可以单独作为下单依据
+    observe   可以进入分析,但**不能单独授权真钱下单**
+    none      只保留历史,不参与决策
+
+未显式声明时按 status 推导:enforced/supported → live;hypothesis → observe;
+refuted/retired → none。**零样本的新假设不应该拿真钱去试。**
+"""
+
+from __future__ import annotations
+
+import argparse
+import sys
+import tomllib
+from dataclasses import dataclass, field
+from pathlib import Path
+
+from meigu_lib import CONFIG_DIR, ROOT, ConfigError, load_vocabulary, rel_to_root
+
+# ---- 结论方向
+SUPPORTS = "supports"
+REFUTES = "refutes"
+INCONCLUSIVE = "inconclusive"
+# ---- 非数据类判定
+ENFORCED = "enforced"
+MANUAL = "manual"
+
+# ---- 证据强度
+INSUFFICIENT = "insufficient"
+WEAK = "weak"
+MODERATE = "moderate"
+STRONG = "strong"
+
+VALID_STATUS = ("invariant", "enforced", "hypothesis", "supported", "refuted", "retired")
+VALID_KIND = ("process", "market")
+VALID_TEST_TYPES = ("enforced_by", "tag_compare", "manual")
+VALID_SCOPE = ("live", "observe", "none")
+
+# 样本阈值(可被每条规则的 min_samples / weak_min_samples 覆盖)
+DEFAULT_WEAK_MIN_SAMPLES = 10
+DEFAULT_MIN_SAMPLES = 20
+
+# 状态 → 默认执行层级。零样本假设默认只能观察。
+SCOPE_BY_STATUS = {
+    "invariant": "live",
+    "enforced": "live",
+    "supported": "live",
+    "hypothesis": "observe",
+    "refuted": "none",
+    "retired": "none",
+}
+
+RESULT_ZH = {SUPPORTS: "支持", REFUTES: "不支持", INCONCLUSIVE: "数据不足",
+             ENFORCED: "程序强制", MANUAL: "需人工核查"}
+CONFIDENCE_ZH = {INSUFFICIENT: "样本不足", WEAK: "弱", MODERATE: "中", STRONG: "强"}
+
+
+def known_gates() -> dict[str, tuple[str, ...]]:
+    """闸门注册表 —— `enforced_by` 只能引用这里真实存在的名字。
+
+    写错闸门名会让规则显示"程序强制"但其实无人把守 —— 那比没有这条规则更危险。
+    延迟导入 preflight(它不 import 本模块,无循环)。
+    """
+    gates: dict[str, tuple[str, ...]] = {
+        "journal_compress": ("--check",),
+        "stats": ("台账校验",),
+        "check_privacy": ("隐私检查",),
+    }
+    try:
+        import preflight
+
+        gates["preflight"] = tuple(preflight.GATE_NAMES)
+    except Exception:                             # noqa: BLE001
+        gates["preflight"] = ()
+    return gates
+
+
+@dataclass
+class Rule:
+    id: str
+    statement: str
+    kind: str = "market"
+    test: dict = field(default_factory=dict)
+    status: str = "hypothesis"
+    execution_scope: str = ""          # 空 = 按 status 推导
+    min_samples: int | None = None
+    weak_min_samples: int | None = None
+    evidence: list[str] = field(default_factory=list)
+    last_audited: str = ""
+
+    @property
+    def test_type(self) -> str:
+        return str(self.test.get("type", ""))
+
+    @property
+    def scope(self) -> str:
+        return self.execution_scope or SCOPE_BY_STATUS.get(self.status, "none")
+
+    @property
+    def active(self) -> bool:
+        """是否参与决策(含仅观察)。"""
+        return self.scope in ("live", "observe")
+
+    @property
+    def may_authorize_live(self) -> bool:
+        """能否**单独**作为真钱下单的依据。"""
+        return self.scope == "live"
+
+    def thresholds(self) -> tuple[int, int]:
+        return (
+            self.weak_min_samples or DEFAULT_WEAK_MIN_SAMPLES,
+            self.min_samples or DEFAULT_MIN_SAMPLES,
+        )
+
+
+@dataclass
+class Verdict:
+    rule: Rule
+    result: str                     # supports | refutes | inconclusive | enforced | manual
+    confidence: str = INSUFFICIENT
+    detail: str = ""
+    suggestion: str = ""
+    samples: int = 0
+
+    @property
+    def may_change_status(self) -> bool:
+        """证据是否强到可以**建议**改状态(仍需用户批准)。"""
+        return self.result in (SUPPORTS, REFUTES) and self.confidence in (MODERATE, STRONG)
+
+    @property
+    def label(self) -> str:
+        if self.result in (ENFORCED, MANUAL, INCONCLUSIVE):
+            return RESULT_ZH[self.result]
+        prefix = "弱" if self.confidence == WEAK else ""
+        return prefix + ("支持" if self.result == SUPPORTS else "反驳")
+
+    @property
+    def icon(self) -> str:
+        if self.result == ENFORCED:
+            return "🔒"
+        if self.result == MANUAL:
+            return "👁"
+        if self.result == INCONCLUSIVE:
+            return "…"
+        strong = self.confidence in (MODERATE, STRONG)
+        if self.result == SUPPORTS:
+            return "✅" if strong else "🟢"
+        return "❌" if strong else "🟠"
+
+
+# ------------------------------------------------------------------ 加载与校验
+def _validate(rule: Rule, seen: set[str], vocab_tags: set[str],
+              gates: dict[str, tuple[str, ...]]) -> list[str]:
+    errs: list[str] = []
+    if not rule.id:
+        errs.append("缺少 id")
+    elif rule.id in seen:
+        errs.append(f"id 重复:{rule.id!r}(evidence 靠 id 累积,不能重名)")
+    if not rule.statement.strip():
+        errs.append(f"{rule.id}: statement 为空 —— 规则必须能被读懂才能被证伪")
+    if rule.kind not in VALID_KIND:
+        errs.append(f"{rule.id}: kind 必须是 {'/'.join(VALID_KIND)},实际 {rule.kind!r}")
+    if rule.status not in VALID_STATUS:
+        errs.append(f"{rule.id}: status 必须是 {'/'.join(VALID_STATUS)},实际 {rule.status!r}")
+    if rule.execution_scope and rule.execution_scope not in VALID_SCOPE:
+        errs.append(
+            f"{rule.id}: execution_scope 必须是 {'/'.join(VALID_SCOPE)},"
+            f"实际 {rule.execution_scope!r}"
+        )
+    if rule.execution_scope == "live" and rule.status == "hypothesis":
+        errs.append(
+            f"{rule.id}: 未经数据支持的 hypothesis 不应直接 execution_scope=live。"
+            f"先以 observe 跑一段,攒够样本再由 review 升级。"
+        )
+    if rule.status in ("refuted", "retired") and rule.execution_scope in ("live", "observe"):
+        errs.append(
+            f"{rule.id}: {rule.status} 的规则不应再参与决策(execution_scope 应为 none)"
+        )
+
+    tt = rule.test_type
+    if tt not in VALID_TEST_TYPES:
+        errs.append(f"{rule.id}: test.type 必须是 {'/'.join(VALID_TEST_TYPES)},实际 {tt!r}")
+    elif tt == "tag_compare":
+        better = [str(x) for x in rule.test.get("better", [])]
+        worse = [str(x) for x in rule.test.get("worse", [])]
+        if not better or not worse:
+            errs.append(f"{rule.id}: tag_compare 需要 better 与 worse 两组标签")
+        unknown = [x for x in better + worse if x not in vocab_tags]
+        if unknown:
+            errs.append(
+                f"{rule.id}: 引用了词表里不存在的标签 {unknown}。"
+                f"检查 config/reason-tags.toml —— "
+                f"引用不存在的标签会让这条规则永远无法被检验,却看不出哪里错了。"
+            )
+        if set(better) & set(worse):
+            errs.append(f"{rule.id}: better 与 worse 有重叠标签,比较无意义")
+    elif tt == "enforced_by":
+        by = str(rule.test.get("by", ""))
+        if not by:
+            errs.append(f"{rule.id}: enforced_by 需要 by(哪道闸门强制)")
+        else:
+            tool, _, gate = by.partition(":")
+            if tool not in gates:
+                errs.append(f"{rule.id}: 未知的工具 {tool!r}。可用:{'/'.join(sorted(gates))}")
+            elif gates[tool] and gate not in gates[tool]:
+                errs.append(
+                    f"{rule.id}: {tool} 里没有名为 {gate!r} 的闸门。"
+                    f"可用:{'/'.join(gates[tool])} —— "
+                    f"写错闸门名会让规则显示『程序强制』但其实无人把守。"
+                )
+    elif tt == "manual" and not rule.test.get("how"):
+        errs.append(f"{rule.id}: manual 需要 how(怎么人工核查)")
+
+    if rule.status == "enforced" and tt != "enforced_by":
+        errs.append(
+            f"{rule.id}: status=enforced 但 test.type={tt!r}。"
+            f"『enforced』表示**有程序把守**;无程序把守的流程纪律用 status=invariant。"
+        )
+    if rule.status == "invariant":
+        if rule.kind != "process":
+            errs.append(f"{rule.id}: invariant 只用于 process 类规则")
+        if tt == "tag_compare":
+            errs.append(
+                f"{rule.id}: invariant 是不可协商的流程不变量,不该由盈亏数据裁决"
+            )
+    return errs
+
+
+def load_rules(required: bool = False, path: Path | None = None,
+               vocab=None) -> tuple[list[Rule], str, bool]:
+    """读 config/rules.toml;缺失时回退 .example。返回 (规则, 来源, 是否样例)。"""
+    vocab = vocab or load_vocabulary()
+    vocab_tags = set(vocab.all)
+    gates = known_gates()
+
+    candidates = (
+        [(path, True)] if path is not None
+        else [(CONFIG_DIR / "rules.toml", False), (CONFIG_DIR / "rules.example.toml", True)]
+    )
+    for path_, is_example in candidates:
+        if path_ is None or not path_.exists():
+            continue
+        path = path_
+        with path.open("rb") as fh:
+            raw = tomllib.load(fh)
+
+        rules: list[Rule] = []
+        errs: list[str] = []
+        seen: set[str] = set()
+        for item in raw.get("rule", []):
+            rule = Rule(
+                id=str(item.get("id", "")),
+                statement=str(item.get("statement", "")),
+                kind=str(item.get("kind", "market")),
+                test=dict(item.get("test") or {}),
+                status=str(item.get("status", "hypothesis")),
+                execution_scope=str(item.get("execution_scope", "")),
+                min_samples=item.get("min_samples"),
+                weak_min_samples=item.get("weak_min_samples"),
+                evidence=[str(e) for e in (item.get("evidence") or [])],
+                last_audited=str(item.get("last_audited", "")),
+            )
+            errs.extend(_validate(rule, seen, vocab_tags, gates))
+            seen.add(rule.id)
+            rules.append(rule)
+
+        if errs:
+            raise ConfigError(
+                f"{rel_to_root(path)} 有 {len(errs)} 处问题:\n  " + "\n  ".join(errs)
+            )
+        if required and is_example and path.parent == CONFIG_DIR:
+            raise ConfigError(
+                "config/rules.toml 不存在,当前用的是样例(只含流程纪律,市场判断全空)。\n"
+                "  执行:cp config/rules.example.toml config/rules.toml,然后回答里面的问题。\n"
+                "  本仓库刻意不提供市场判断类规则 —— 那必须是你自己的。"
+            )
+        return rules, rel_to_root(path), is_example
+
+    return [], "(未找到 config/rules*.toml)", True
+
+
+# ------------------------------------------------------------------------ 审计
+def _tag_stats(summary: dict, tag: str) -> tuple[float | None, int]:
+    """(均笔实现盈亏, 独立决策事件数)。
+
+    ★ 样本单位是**决策事件**(一笔卖出 = 一次退出决策),不是 FIFO lot 数量 ——
+    一笔卖单可能匹配三个历史买入批次,那仍然只是一个决策。
+    """
+    d = (summary.get("by_tag") or {}).get(tag)
+    if not d:
+        return None, 0
+    return d.get("avg_pnl"), int(d.get("events", d.get("count", 0)) or 0)
+
+
+def audit_rule(rule: Rule, summary: dict) -> Verdict:
+    tt = rule.test_type
+
+    if tt == "enforced_by":
+        return Verdict(rule, ENFORCED, STRONG, f"由 {rule.test.get('by')} 强制",
+                       "审计时确认该闸门仍存在且未被绕过")
+
+    if tt == "manual":
+        sug = ("不可关闭的流程不变量 —— 复盘时确认它没有被绕过"
+               if rule.status == "invariant" else "复盘时人工过一遍")
+        return Verdict(rule, MANUAL, INSUFFICIENT, str(rule.test.get("how", "")), sug)
+
+    if tt != "tag_compare":
+        return Verdict(rule, INCONCLUSIVE, INSUFFICIENT, f"未知的 test.type:{tt!r}")
+
+    weak_n, min_n = rule.thresholds()
+    better = [str(t) for t in rule.test.get("better", [])]
+    worse = [str(t) for t in rule.test.get("worse", [])]
+
+    b = [(t, *_tag_stats(summary, t)) for t in better]
+    w = [(t, *_tag_stats(summary, t)) for t in worse]
+    b_ok = [(t, v, n) for t, v, n in b if v is not None]
+    w_ok = [(t, v, n) for t, v, n in w if v is not None]
+
+    if not b_ok or not w_ok:
+        missing = [t for t, v, _ in b + w if v is None]
+        return Verdict(rule, INCONCLUSIVE, INSUFFICIENT,
+                       f"缺少归集数据的标签:{'/'.join(missing) or '(全部)'}",
+                       "继续记录,或检查这些标签是否真的在用")
+
+    def wavg(rows):
+        """按决策事件数加权 —— 3 个事件的标签不应与 100 个事件的等权。"""
+        total = sum(n for _, _, n in rows)
+        if not total:
+            return sum(v for _, v, _ in rows) / len(rows)
+        return sum(v * n for _, v, n in rows) / total
+
+    b_avg, w_avg = wavg(b_ok), wavg(w_ok)
+    n = min(sum(n for _, _, n in b_ok), sum(n for _, _, n in w_ok))
+
+    def fmt(rows):
+        return " / ".join(
+            f"{t} {'+' if v >= 0 else '-'}${abs(v):.2f}({c} 事件)" for t, v, c in rows
+        )
+
+    detail = f"{fmt(b_ok)}  vs  {fmt(w_ok)}"
+    result = SUPPORTS if b_avg > w_avg else REFUTES
+
+    if n < weak_n:
+        return Verdict(rule, INCONCLUSIVE, INSUFFICIENT,
+                       f"{detail} —— 较小一侧仅 {n} 个事件(< {weak_n},方向不可信)",
+                       f"攒够 {weak_n} 个决策事件才谈趋势,{min_n} 个才谈改状态", n)
+    if n < min_n:
+        return Verdict(rule, result, WEAK, f"{detail} —— 较小一侧 {n} 个事件",
+                       f"只是趋势提示,不足以改状态(需 ≥{min_n} 个决策事件)", n)
+
+    conf = STRONG if n >= min_n * 2 else MODERATE
+    if result == SUPPORTS:
+        sug = ("证据足够,可**建议**升为 supported —— 仍需你本人批准"
+               if rule.status == "hypothesis" else "")
+    else:
+        sug = ("数据与规则相反。修正判定标准,或降为 refuted(**保留记录,不要删**)—— "
+               "从未被数据支持过的规则是包袱,不是资产")
+    return Verdict(rule, result, conf, f"{detail} —— 较小一侧 {n} 个事件", sug, n)
+
+
+def audit_rules(rules: list[Rule], summary: dict,
+                include_inactive: bool = False) -> list[Verdict]:
+    return [audit_rule(r, summary) for r in rules if include_inactive or r.active]
+
+
+# ------------------------------------------------------------------ rules-check
+def cross_check_strategy(rules: list[Rule]) -> list[str]:
+    """检查散文版 `modes/_strategy.md` 与 rules.toml 的一致性。"""
+    path = ROOT / "modes" / "_strategy.md"
+    if not path.exists():
+        return []
+    text = path.read_text(encoding="utf-8")
+    return [
+        f"{r.id}: 未在 modes/_strategy.md 里被引用 —— "
+        f"散文版应以稳定 id 引用规则,否则两边会各自漂移"
+        for r in rules
+        if r.id and r.id not in text
+    ]
+
+
+def main(argv: list[str] | None = None) -> int:
+    ap = argparse.ArgumentParser(description="校验 config/rules.toml")
+    ap.add_argument("--file", help="指定规则文件")
+    ap.add_argument("--strict", action="store_true", help="散文不同步也算失败")
+    args = ap.parse_args(argv)
+
+    try:
+        rules, src, is_example = load_rules(path=Path(args.file) if args.file else None)
+    except ConfigError as exc:
+        print(f"❌ {exc}", file=sys.stderr)
+        return 1
+
+    print(f"=== 规则校验 · {src} ===")
+    print(f"共 {len(rules)} 条 · " + " · ".join(
+        f"{k} {sum(1 for r in rules if r.status == k)}"
+        for k in VALID_STATUS if any(r.status == k for r in rules)))
+    print("执行层级:" + " · ".join(
+        f"{k} {sum(1 for r in rules if r.scope == k)}"
+        for k in VALID_SCOPE if any(r.scope == k for r in rules)))
+
+    obs = [r for r in rules if r.scope == "observe"]
+    if obs:
+        print(f"\n⚠️  {len(obs)} 条处于观察期,**不能单独作为真钱下单依据**:")
+        for r in obs:
+            print(f"     · {r.id}:{r.statement[:44]}")
+
+    if not [r for r in rules if r.kind == "market" and r.may_authorize_live]:
+        print("\nℹ️  尚无可直接指导下单的市场判断类规则(新装时的正常状态)。")
+
+    warns = cross_check_strategy(rules)
+    if warns:
+        print(f"\n⚠️  {len(warns)} 条与散文版不同步:")
+        for w in warns:
+            print(f"     · {w}")
+
+    print("\n✅ 格式、词表引用、闸门引用全部通过。")
+    return 1 if (warns and args.strict) else 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

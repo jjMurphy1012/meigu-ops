@@ -1,0 +1,133 @@
+name: no-user-data
+
+# 数据分层契约(AGENTS.md §1 / docs/DATA_CONTRACT.md)的最后一道防线。
+# 本地的 make check-privacy 是同一份脚本 —— 这里只是保证没人绕过它。
+#
+# 隐私泄漏和别的 bug 不一样:一旦推上公网就不可逆(会被缓存、被索引、
+# 存在于 git 历史里),所以这个 job 必须能挡住 merge。
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  privacy:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          # 需要完整历史才能扫已提交的内容,而不只是当前 tree。
+          fetch-depth: 0
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.13"
+
+      - name: 隐私检查(与本地 make check-privacy 同一份脚本)
+        run: python scripts/check_privacy.py
+
+      - name: 用户层路径绝不能被 git 跟踪
+        run: |
+          set -euo pipefail
+          FORBIDDEN=(
+            "config/profile.toml"
+            "config/watchlist.toml"
+            ".claude/settings.local.json"
+            ".mcp.json"
+            ".env"
+          )
+          fail=0
+          for path in "${FORBIDDEN[@]}"; do
+            if git ls-files --error-unmatch "$path" >/dev/null 2>&1; then
+              echo "::error file=$path::用户层文件被纳入版本控制。"
+              fail=1
+            fi
+          done
+
+          # data/ 与 reports/ 下只允许 .gitkeep
+          leaked=$(git ls-files 'data/*' 'reports/*' | grep -v '\.gitkeep$' || true)
+          if [ -n "$leaked" ]; then
+            echo "::error::data/ 与 reports/ 下只允许提交 .gitkeep,发现:"
+            echo "$leaked"
+            fail=1
+          fi
+
+          [ "$fail" -eq 0 ] && echo "✅ 无用户层文件被跟踪"
+          exit "$fail"
+
+      # ⚠️ 这一步扫的是**全部 git 历史**,不只是当前 tree。
+      #
+      # 2026-08-18 的教训 —— 同一个防线连续三重失效:
+      #   ① 只扫当前 tree(历史脏了发现不了)
+      #   ② 显式排除了正好出事的那个文件
+      #   ③ 用了 `git grep -E '\b...\b'`,而 git 的 ERE **不支持 \b 词边界**
+      #      → 整个步骤从未匹配到任何东西,却一直报绿
+      #
+      # 所以现在:不排除任何文件、遍历所有 ref、并且**先自检再扫描**。
+      # 一个无法自证能检测到东西的扫描器,比没有扫描器更危险 —— 它制造虚假的安心。
+      - name: 全部 git 历史里不得出现真实账户号形态
+        run: |
+          set -uo pipefail
+
+          # 用拼接构造探针值,避免本文件自身出现 9 位连续数字字面量
+          # (check_privacy.py 会抓它 —— 这正是它该做的)
+          PROBE=.ci-privacy-probe.txt
+          PRE=555000
+          printf '__ci_probe__ %s999\n' "$PRE" > "$PROBE"
+
+          # 模式选择 == 自检:能匹配到探针的模式才被采用。
+          # git 的 ERE **不支持 \b 词边界**,所以优先 PCRE(-P),
+          # 不可用则退回显式字符类边界的 ERE。
+          MODE=""
+          if git grep --no-index -qIP '\b[0-9]{9}\b' -- "$PROBE" 2>/dev/null; then
+            MODE=P; PATTERN='\b[0-9]{9}\b'
+          elif git grep --no-index -qIE '(^|[^0-9])[0-9]{9}([^0-9]|$)' -- "$PROBE" 2>/dev/null; then
+            MODE=E; PATTERN='(^|[^0-9])[0-9]{9}([^0-9]|$)'
+          fi
+          rm -f "$PROBE"
+
+          if [ -z "$MODE" ]; then
+            echo "::error::扫描器自检失败 —— 连注入的已知 9 位数字都匹配不到。"
+            echo "这一步在静默失效,不要相信它的绿色结果。检查 git 版本与正则支持。"
+            exit 1
+          fi
+          echo "✅ 自检通过(采用模式 -$MODE)"
+
+          # --- 正式扫描:全部 ref 的全部提交 ---
+          # 只扫当前 tree 是不够的:历史一旦脏了,改 tree 不会让旧 blob 消失。
+          revs=$(git rev-list --all)
+          if [ -z "$revs" ]; then echo "无提交,跳过"; exit 0; fi
+          # shellcheck disable=SC2086
+          hits=$(git grep -nI"$MODE" "$PATTERN" $revs -- ':!*.lock' || true)
+
+          # 等价的占位值正则,刻意不写出 9 位连续数字字面量。
+          # 绝不要把真实号或其前缀加进来 —— 那等于关掉警报,
+          # 而这正是 2026-08-18 首版泄漏的手法之一。
+          PLACEHOLDERS='(0{9}|1{9}|12345678[0-9]|98765432[0-9]|555000[0-9]{3}|111222333)'
+          # 用 printf 而非 echo:被扫内容里可能含 `\n` 字面量,
+          # 部分 shell 的 echo 会把它展开成真换行,一条命中被拆成多行后
+          # 占位值过滤就会失效 —— 又一个静默失效的入口。
+          real=$(printf '%s\n' "$hits" | grep -vE "$PLACEHOLDERS" | grep -v '^$' || true)
+
+          if [ -n "$real" ]; then
+            echo "::error::在 git 历史中发现疑似 9 位券商账户号:"
+            printf '%s\n' "$real"
+            echo ""
+            echo "账户号只能存在于 config/profile.toml(已 gitignore)。"
+            echo "系统层文件里指代账户请写 {{account_id}},展示只露后 4 位。"
+            echo "⚠️ 历史被污染时:改当前 tree 不够 —— 必须重写历史或重建仓库。"
+            exit 1
+          fi
+          echo "✅ 全部历史($(printf '%s\n' "$revs" | wc -l | tr -d ' ') 个提交)未发现真实账户号形态"
+
+      - name: 免责声明必须存在
+        run: |
+          test -f DISCLAIMER.md || { echo "::error::DISCLAIMER.md 缺失 —— 公开的交易仓必须带免责声明。"; exit 1; }
+          grep -q "不构成投资建议" DISCLAIMER.md || { echo "::error::DISCLAIMER.md 缺少中文免责表述。"; exit 1; }
+          grep -q "not provide investment advice" DISCLAIMER.md || { echo "::error::DISCLAIMER.md 缺少英文免责表述。"; exit 1; }
+          echo "✅ 免责声明齐全"
