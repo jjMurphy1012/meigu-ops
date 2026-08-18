@@ -303,9 +303,12 @@ macOS 上 `make doctor` 会替你检查这三项(`caffeinate` 是否常驻、是
 
 ## 平台支持
 
+**三平台 × Python 3.11/3.13 共 6 个 CI job,每次提交都跑一遍** ——
+下面这张表是实测结果,不是代码审查的结论。
+
 | | macOS | Windows | Linux |
 |---|---|---|---|
-| 全部脚本与闸门 | ✅ | ✅ | ✅ |
+| 全部脚本与闸门(366 个测试) | ✅ CI | ✅ CI | ✅ CI |
 | 仪表盘 TUI(`make dashboard`) | ✅ | ⚠️ 需 WSL 或 `windows-curses` | ✅ |
 | 仪表盘静态渲染(`--render`) | ✅ | ✅ | ✅ |
 | 防休眠自检(`make doctor`) | ✅ | ➖ 自动跳过,需自己在电源选项里关休眠 | ➖ 自动跳过 |
@@ -316,6 +319,10 @@ macOS 上 `make doctor` 会替你检查这三项(`caffeinate` 是否常驻、是
 (macOS 上的 `caffeinate` 是可选的防休眠措施,不是运行前提)。
 所有文件都在仓库目录内。唯一会写到仓库之外的是你自己配置的 Claude Code 设置。
 
+> 加上 Windows runner 的**第一次**运行就抓到两个真问题:控制台编码编不出 ✅
+> 导致每条命令都崩、以及一处写死 `/` 的路径断言。**在那之前"Windows ✅"
+> 只是读代码读出来的结论** —— 这也是为什么现在它由 CI 证明。
+>
 > Windows 上唯一的硬依赖是 `tzdata` —— 因为 Windows 没有系统时区数据库,
 > 而本项目**所有**时间判断都基于 ET,绝不退回本机时区(本机时钟漂移过,
 > 见 `modes/_mechanics.md`)。`make doctor` 会检查这一项并给出安装命令。
