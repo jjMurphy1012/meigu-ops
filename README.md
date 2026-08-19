@@ -12,7 +12,7 @@
 <p align="center">
   <img src="https://img.shields.io/badge/Python-3.11+-3776AB?style=flat&logo=python&logoColor=white" alt="Python 3.11+">
   <img src="https://img.shields.io/badge/dependencies-none-2ea44f?style=flat" alt="Zero dependencies">
-  <img src="https://img.shields.io/badge/tests-378%20passing-2ea44f?style=flat" alt="378 tests">
+  <img src="https://img.shields.io/badge/tests-387%20passing-2ea44f?style=flat" alt="387 tests">
   <a href="https://claude.com/claude-code"><img src="https://img.shields.io/badge/Built_with-Claude_Code-000?style=flat&logo=anthropic&logoColor=white" alt="Built with Claude Code"></a>
   <img src="https://img.shields.io/badge/License-MIT-blue.svg" alt="MIT">
   <a href="DISCLAIMER.md"><img src="https://img.shields.io/badge/%E2%9A%A0%EF%B8%8F-%E4%B8%8D%E6%9E%84%E6%88%90%E6%8A%95%E8%B5%84%E5%BB%BA%E8%AE%AE-critical" alt="Not investment advice"></a>
@@ -36,8 +36,10 @@
 
 **一个 AI 自动炒股的辅助系统。**
 
-它默认在每个交易日设置 **五个 cron 节点**。到点后 AI 自己醒来,读实时行情与持仓、
-比对你的规则、给出买/卖/不动的结论,够格就下单,并把当天发生的一切写进台账:
+它为每个交易日设计了 **五个默认检查时点**,由 AI CLI 的**会话级** scheduler
+在首次运行时创建(仓库本身不含持久调度器 —— 细节见「它是怎么"自动"的」)。
+到点后 AI 自己醒来,读实时行情与持仓、比对你的规则、给出买/卖/不动的结论,
+够格就下单,并把当天发生的一切写进台账:
 
 ```
 9:12   /meigu-ops premarket   盘前 → 候选清单 + 触发位 + 防守预案 + 今日不做什么
@@ -56,13 +58,13 @@
 
 | 你得到的 | 靠什么实现 |
 |---|---|
-| **盯盘不再消耗你** | 五个时点自动触发,给的是完整判断(行情 + 持仓 + 当日催化 + 规则比对 + 明确结论),不是"XX 涨了 3%"的推送。而且它不会疲劳 —— 人连续盯盘多天会把"再等等"当成决策 |
+| **盯盘不再消耗你** | 五个检查时点自动触发,给的是完整判断(行情 + 持仓 + 当日催化 + 规则比对 + 明确结论),不是"XX 涨了 3%"的推送。而且它不会疲劳 —— 人连续盯盘多天会把"再等等"当成决策 |
 | **每笔单必过闸门** | `preflight.py` 二十多道程序化检查,返回 `ALLOW` / `DRY_RUN` / `DENY`。**`DENY` 就是不许下,AI 不能"人工判断通过"** |
 | **纪律有了对错判据** | 规则被引用、被台账数据审计、被升降级。样本不足时审计器**拒绝下结论** |
 | **仓位按证据缩放** | 未验证假设 40%,弱支持 70%,已支持满额。证据决定**尺寸**而非能否交易 —— 否则第一天就死锁 |
 | **遗忘不再有代价** | 尾盘自动写日志并分层压缩。半年后"当时为什么卖",答案在台账里 |
 | **数据不跟仓库跑** | 策略、账户、台账全部 gitignore + 扫描器 + CI,**扫描器自己也有测试** |
-| **全部可审计** | 378 个测试,只用标准库。**每一道闸门都有测试证明它真的拦得住** |
+| **全部可审计** | 387 个测试,只用标准库。**每一道闸门都有测试证明它真的拦得住** |
 
 ### 闸门挡住的是"你事后才会发现"的错误
 
@@ -258,7 +260,7 @@ macOS 上 `make doctor` 会替你查这三项。**`caffeinate` 挡不住物理�
 
 | | macOS | Windows | Linux |
 |---|---|---|---|
-| 全部脚本与闸门(378 个测试) | ✅ CI | ✅ CI | ✅ CI |
+| 全部脚本与闸门(387 个测试) | ✅ CI | ✅ CI | ✅ CI |
 | 仪表盘 TUI(`make dashboard`) | ✅ | ⚠️ 需 WSL 或 `windows-curses` | ✅ |
 | 仪表盘静态渲染(`--render`) | ✅ | ✅ | ✅ |
 | 防休眠自检(`make doctor`) | ✅ | ➖ 自动跳过,需自己在电源选项里关休眠 | ➖ 自动跳过 |

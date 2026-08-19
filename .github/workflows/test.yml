@@ -72,6 +72,11 @@ jobs:
             python scripts/dashboard.py --demo --render "$tab" --width 100 --height 30 > /dev/null
           done
           python scripts/setup.py --demo > /dev/null
+          # 隐私扫描是"提交前最后一道防线",它自己崩了等于没检查 ——
+          # 所以三平台都要真的跑一遍(Windows 控制台编码曾让它 UnicodeEncodeError)。
+          python scripts/check_privacy.py
+          python scripts/doctor.py || true        # doctor 会因缺配置返回非零,只看它不崩
+          python scripts/journal_compress.py --check || true
           echo '{"portfolio":{"total":1}}' | python scripts/snapshot.py --stdin --checkpoint ci
           python scripts/snapshot.py --list
 

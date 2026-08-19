@@ -320,6 +320,27 @@ def print_report(s: dict, demo_mode: bool = False) -> None:
           "(现金闲置的机会成本、市价单滑点)必须在解读时主动提出。")
 
 
+def _record_review_stage(demo: bool, n_trades: int) -> None:
+    """为演练的 review 环节留一条机器证据 —— **只在完整跑完之后**调用。
+
+    两个曾经的错误都修在这里:
+    ① 旧实现在解析日期参数之前就写证据 —— 一次 `--since not-a-date` 崩溃,
+       却留下了"review 成功"的记录。
+    ② 旧实现把"台账 0 笔"记为失败,于是新用户进入死锁:
+       没开真钱 → 没有成交 → review 失败 → 演练不能完成 → 不能开真钱。
+       **空台账只说明数据不足,不说明链路没跑通** —— 演练验证的是后者。
+    """
+    if demo:
+        return
+    try:
+        from setup import append_drill_evidence
+
+        note = f"台账 {n_trades} 笔已解析并统计" + ("(空台账:链路通,数据不足)" if not n_trades else "")
+        append_drill_evidence("review", note, ok=True)
+    except Exception:                             # noqa: BLE001
+        pass
+
+
 def main(argv: list[str] | None = None) -> int:
     ap = argparse.ArgumentParser(description="交易台账绩效统计")
     ap.add_argument("--since", help="只统计该日期(含)之后的交易,YYYY-MM-DD")
@@ -353,22 +374,18 @@ def main(argv: list[str] | None = None) -> int:
         )
         return 2
 
-    if not args.demo:
-        # 演练进行中时为 review 环节留一条机器证据;不在演练中则无感。
-        try:
-            from setup import append_drill_evidence
-
-            append_drill_evidence("review", f"台账 {len(trades)} 笔已解析并统计",
-                                  ok=len(trades) > 0)
-        except Exception:                         # noqa: BLE001
-            pass
-
-    if args.since:
-        since = dt.date.fromisoformat(args.since)
-        trades = [t for t in trades if t.date >= since]
-    if args.until:
-        until = dt.date.fromisoformat(args.until)
-        trades = [t for t in trades if t.date <= until]
+    # 日期参数解析失败要给结构化退出码,不是 traceback ——
+    # 而且必须发生在写演练证据**之前**(否则一次崩溃仍会留下"review 成功")。
+    try:
+        if args.since:
+            since = dt.date.fromisoformat(args.since)
+            trades = [t for t in trades if t.date >= since]
+        if args.until:
+            until = dt.date.fromisoformat(args.until)
+            trades = [t for t in trades if t.date <= until]
+    except ValueError as exc:
+        print(f"❌ 日期格式错误(需 YYYY-MM-DD):{exc}", file=sys.stderr)
+        return 2
     if args.symbol:
         trades = [t for t in trades if t.symbol == args.symbol.upper()]
 
@@ -389,12 +406,14 @@ def main(argv: list[str] | None = None) -> int:
                 }
             )
         print(json.dumps(out, ensure_ascii=False, indent=2, default=str))
+        _record_review_stage(args.demo, len(trades))
         return 0
 
     global RULES_PATH_OVERRIDE, VOCAB_OVERRIDE
     RULES_PATH_OVERRIDE = rules_path
     VOCAB_OVERRIDE = vocab
     print_report(s, demo_mode=args.demo)
+    _record_review_stage(args.demo, len(trades))
     return 0
 
 

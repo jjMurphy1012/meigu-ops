@@ -17,6 +17,18 @@ import subprocess
 import sys
 from pathlib import Path
 
+# 与其他 CLI 共用同一套输出编码引导:Windows 控制台编不出 ✅,
+# 这个脚本又恰恰是"提交前最后一道防线" —— 它崩了等于没检查。
+# 用 try 包住是因为本脚本要能在没有 scripts/ 在 sys.path 时独立运行。
+try:
+    sys.path.insert(0, str(Path(__file__).resolve().parent))
+    from meigu_lib import _force_utf8_output
+
+    _force_utf8_output()
+except Exception:                                 # noqa: BLE001
+    pass
+
+
 ROOT = Path(__file__).resolve().parent.parent
 
 # 绝不应该被提交的路径(即使 .gitignore 漏了)

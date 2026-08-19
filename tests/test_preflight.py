@@ -876,6 +876,66 @@ class TestExitQuantityEvidence(unittest.TestCase):
         self.assertEqual(r.verdict, ALLOW, [c.detail for c in r.blockers])
 
 
+class TestAllConfigSectionsValidated(unittest.TestCase):
+    """★ 只验 [execution] 是不够的 —— 少验一个 section 就多一条崩溃路径。"""
+
+    def test_malformed_sections_deny_instead_of_crashing(self):
+        cases = {
+            "position.max_single_pct 非数字": ("position", {"max_single_pct": "oops"}),
+            "cash.floor_pct 非数字": ("cash", {"floor_pct": "oops"}),
+            "trade.size_std 非数字": ("trade", {"size_std": "oops"}),
+        }
+        for name, (sec, patch) in cases.items():
+            with self.subTest(case=name):
+                c = cfg()
+                c[sec].update(patch)
+                r = run(order(), c, NOON, vocab=TEST_VOCAB)      # 不得抛异常
+                self.assertEqual(r.verdict, DENY)
+                self.assertIn("配置结构", names_failed(r))
+
+    def test_section_of_wrong_type_denies(self):
+        c = cfg()
+        c["position"] = "oops"
+        r = run(order(), c, NOON, vocab=TEST_VOCAB)
+        self.assertEqual(r.verdict, DENY)
+        self.assertIn("配置结构", names_failed(r))
+
+
+class TestNegativeRiskDataRejected(unittest.TestCase):
+    """★ "允许 0" 和 "允许负数" 是两件事。
+
+    为了让新标的买入(持仓 0)通过而放开正数校验,结果连 -100 也一起放行了 ——
+    负持仓会让集中度被算低。
+    """
+
+    def _buy(self, **kw):
+        kw.setdefault("amount_usd", 1.0)
+        o = order(side="buy", reason_tag="建仓", intent="", **kw)
+        o.pop("primary_rule_id", None)
+        return o
+
+    def test_negative_position_is_denied(self):
+        r = run(self._buy(position={"market_value": -100, "qty": -1, "avg_cost": -100}),
+                cfg(), NOON, vocab=TEST_VOCAB)
+        self.assertEqual(r.verdict, DENY)
+        self.assertIn("订单结构", names_failed(r))
+
+    def test_negative_portfolio_is_denied(self):
+        r = run(self._buy(portfolio={"total_value": -1000.0, "buying_power": 400.0,
+                                     "equity_value": -600.0}),
+                cfg(), NOON, vocab=TEST_VOCAB)
+        self.assertEqual(r.verdict, DENY)
+        self.assertIn("订单结构", names_failed(r))
+
+    def test_zero_position_still_allowed_for_new_symbol(self):
+        """修负数不能把新标的买入重新堵死。"""
+        o = self._buy(amount_usd=20.0, position={"market_value": 0, "qty": 0},
+                      portfolio={"total_value": 1000.0, "buying_power": 400.0,
+                                 "equity_value": 600.0})
+        r = run(o, cfg(), NOON, vocab=TEST_VOCAB)
+        self.assertEqual(r.verdict, ALLOW, [c.detail for c in r.blockers])
+
+
 if __name__ == "__main__":
     unittest.main()
 

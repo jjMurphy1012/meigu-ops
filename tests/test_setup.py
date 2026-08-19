@@ -108,15 +108,8 @@ class TestChecklistCompleteness(unittest.TestCase):
 
 class TestMcpRecordValidation(unittest.TestCase):
     def setUp(self):
-        self.tmp = Path(tempfile.mkdtemp()) / "setup-state.json"
-        self._orig = S.STATE_FILE
-        S.STATE_FILE = self.tmp
-        self._orig_cfg = S.CONFIG_DIR
-        S.CONFIG_DIR = Path(tempfile.mkdtemp())   # 无 profile.toml,跳过一致性比对
-
-    def tearDown(self):
-        S.STATE_FILE = self._orig
-        S.CONFIG_DIR = self._orig_cfg
+        sandbox(self, profile=None)          # 无 profile.toml,跳过一致性比对
+        self.tmp = S.STATE_FILE
 
     def test_all_true_is_recorded(self):
         msg = S.record_mcp(full_mcp())
@@ -150,15 +143,9 @@ class TestAccountMismatch(unittest.TestCase):
     """读到的账户与配置不一致时必须拒绝 —— 不能替用户挑一个。"""
 
     def setUp(self):
-        d = Path(tempfile.mkdtemp())
-        (d / "profile.toml").write_text(
-            '[account]\nid = "111222333"\n[execution]\nenabled = false\ndry_run = true\n',  # privacy-allow
-            encoding="utf-8")
-        self._c, S.CONFIG_DIR = S.CONFIG_DIR, d
-        self._s, S.STATE_FILE = S.STATE_FILE, Path(tempfile.mkdtemp()) / "s.json"
-
-    def tearDown(self):
-        S.CONFIG_DIR, S.STATE_FILE = self._c, self._s
+        # 用统一的 sandbox():手工打桩漏掉 SALT_FILE 时,测试会把
+        # data/.setup-salt 写进真实仓库 —— 干净 clone 跑完测试就"脏"了。
+        sandbox(self, PROFILE_OK.replace("555000111", "111222333"))  # privacy-allow
 
     def test_mismatched_account_is_rejected(self):
         with self.assertRaises(ConfigError) as ctx:
@@ -173,15 +160,9 @@ class TestReadonlyDuringVerification(unittest.TestCase):
     """只读验证必须在执行关闭的状态下进行,否则"只读"无从谈起。"""
 
     def setUp(self):
-        d = Path(tempfile.mkdtemp())
-        (d / "profile.toml").write_text(
-            '[account]\nid = "111222333"\n[execution]\nenabled = true\ndry_run = false\n',  # privacy-allow
-            encoding="utf-8")
-        self._c, S.CONFIG_DIR = S.CONFIG_DIR, d
-        self._s, S.STATE_FILE = S.STATE_FILE, Path(tempfile.mkdtemp()) / "s.json"
-
-    def tearDown(self):
-        S.CONFIG_DIR, S.STATE_FILE = self._c, self._s
+        sandbox(self, PROFILE_OK.replace("555000111", "111222333")   # privacy-allow
+                                .replace("enabled = false", "enabled = true")
+                                .replace("dry_run = true", "dry_run = false"))
 
     def test_live_execution_blocks_readonly_verification(self):
         with self.assertRaises(ConfigError) as ctx:
@@ -302,6 +283,38 @@ class TestDrillRecord(unittest.TestCase):
         self._evidence(rid)
         with self.assertRaises(ConfigError):
             S.record_drill(full_drill(run_id="deadbeef"))
+
+
+class TestDrillRetry(unittest.TestCase):
+    """★ 演练本来就是"跑一遍、发现问题、修好、再跑一遍"。
+
+    只要历史上出现过一次 ok=false 就永久否决同一个 run,等于逼人重开演练。
+    每个环节只采信**最后一条**证据。
+    """
+
+    def setUp(self):
+        self.dir = sandbox(self)
+        stub_prereqs(self)
+
+    def test_failed_stage_then_success_is_accepted(self):
+        S.start_drill()
+        S.append_drill_evidence("preflight", "x", ok=True, verdict="DRY_RUN")
+        S.append_drill_evidence("journal", "3 处结构错误", ok=False)
+        S.append_drill_evidence("journal", "修好了", ok=True)     # 重跑并通过
+        S.append_drill_evidence("review", "x", ok=True)
+        S.record_drill(full_drill())
+        self.assertTrue(json.loads(S.STATE_FILE.read_text())["drill"]["passed"])
+
+    def test_success_then_failure_is_still_rejected(self):
+        """顺序反过来:最后一次是失败,就不算通过。"""
+        S.start_drill()
+        S.append_drill_evidence("preflight", "x", ok=True, verdict="DRY_RUN")
+        S.append_drill_evidence("journal", "先通过了", ok=True)
+        S.append_drill_evidence("journal", "又坏了", ok=False)
+        S.append_drill_evidence("review", "x", ok=True)
+        with self.assertRaises(ConfigError) as cm:
+            S.record_drill(full_drill())
+        self.assertIn("最近一次", str(cm.exception))
 
 
 class TestPrerequisitesForDrill(unittest.TestCase):

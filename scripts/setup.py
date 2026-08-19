@@ -115,16 +115,22 @@ def _read_profile() -> dict:
         return {}
 
 
-def _salt() -> str:
+def _salt(create: bool = True) -> str:
     """本机盐值。只用于账户指纹,不参与任何加密。
 
     有盐才能让指纹既能比对、又不可反推 —— 券商账户号的搜索空间太小,
     不加盐的 sha256 等于明文。文件属于用户层,已 gitignore。
+
+    `create=False` 时不落盘 —— **只读判定不该产生副作用**:
+    跑一遍测试或 `make setup` 就在干净 clone 的 data/ 里留下 `.setup-salt`,
+    随后源码压缩包(没有 .git)的隐私扫描会因此报错。
     """
     if SALT_FILE.exists():
         s = SALT_FILE.read_text(encoding="utf-8").strip()
         if s:
             return s
+    if not create:
+        return ""
     DATA_DIR.mkdir(parents=True, exist_ok=True)
     s = secrets.token_hex(16)
     SALT_FILE.write_text(s + "\n", encoding="utf-8")
@@ -135,7 +141,7 @@ def _salt() -> str:
     return s
 
 
-def account_fingerprint(account_id: str) -> str:
+def account_fingerprint(account_id: str, *, create_salt: bool = True) -> str:
     """账户的不可逆指纹。
 
     ★ 为什么不存后 4 位就够:后 4 位相同的两个账户会被认成同一个,
@@ -145,14 +151,23 @@ def account_fingerprint(account_id: str) -> str:
     norm = "".join(ch for ch in str(account_id) if ch.isalnum()).lower()
     if not norm:
         return ""
-    return hashlib.sha256((_salt() + ":" + norm).encode()).hexdigest()
+    salt = _salt(create=create_salt)
+    if not salt:
+        return ""                     # 还没有盐 = 还没有任何验证记录可比对
+    return hashlib.sha256((salt + ":" + norm).encode()).hexdigest()
 
 
-def current_account_fingerprint() -> str:
+def current_account_fingerprint(*, create_salt: bool = False) -> str:
+    """当前配置账户的指纹。
+
+    默认 **不创建** 盐文件 —— 这个函数被 `check_mcp` / `check_automation`
+    等只读判定调用,只读判定不该往用户目录里写东西。
+    真正需要落盘的是 `record_mcp` / `start_drill` 这些写入路径。
+    """
     acct = str(_read_profile().get("account", {}).get("id", "")).strip()
     if not acct or acct in PLACEHOLDER_ACCOUNTS:
         return ""
-    return account_fingerprint(acct)
+    return account_fingerprint(acct, create_salt=create_salt)
 
 
 def validate_execution(cfg: dict) -> list[str]:
@@ -483,7 +498,7 @@ def record_mcp(payload: dict) -> str:
     state["mcp_check"] = {
         "passed": True,
         "at": now_et().strftime("%Y-%m-%d %H:%M ET"),
-        "account_fp": account_fingerprint(acct),
+        "account_fp": account_fingerprint(acct, create_salt=True),
         "account_last4": acct[-4:],
         "checks": {k: True for k in MCP_CHECKS},
         "notes": str(payload.get("notes", "")),
@@ -505,7 +520,7 @@ def start_drill() -> str:
         raise ConfigError(
             "当前是真钱模式(enabled=true 且 dry_run=false)—— 演练必须在 dry_run 下进行。"
         )
-    fp = current_account_fingerprint()
+    fp = current_account_fingerprint(create_salt=True)
     if not fp:
         raise ConfigError("配置里没有有效账户号,无法开始演练")
 
@@ -646,15 +661,23 @@ def record_drill(payload: dict) -> str:
             f"run {run_id} 有 {len(ev)} 条证据,但没有一条是判定为 DRY_RUN 的 preflight —— "
             f"演练要求走完闸门并停在模拟下单。"
         )
-    # ★ "跑过"不等于"跑通"。日志结构校验失败也会留下一条 journal 证据,
-    # 旧实现只看 stage 名字在不在,于是一份结构损坏的日志照样算演练通过。
-    stages = {e.get("stage") for e in ev if e.get("ok") is not False}
-    failed = sorted({e.get("stage") for e in ev if e.get("ok") is False}
+    # ★ "跑过"不等于"跑通":结构损坏的日志也会留下 journal 证据,
+    # 只看 stage 名在不在的话,那份坏日志照样算演练通过。
+    #
+    # 但只要出现过一次失败就永久否决同一个 run 也不对 —— 演练本来就是
+    # "跑一遍、发现问题、修好、再跑一遍"。所以**每个环节只采信最后一条证据**。
+    latest: dict[str, dict] = {}
+    for e in ev:
+        if e.get("stage"):
+            latest[e["stage"]] = e            # 后写的覆盖先写的
+    stages = {s for s, e in latest.items() if e.get("ok") is not False}
+    failed = sorted({s for s, e in latest.items() if e.get("ok") is False}
                     & set(MACHINE_VERIFIED_STAGES))
     if failed:
         raise ConfigError(
-            f"以下环节跑过但**没通过**:{'、'.join(failed)}\n"
-            f"  先把它们修到通过,再记录演练 —— 演练的意义是证明链路是通的。"
+            f"以下环节**最近一次**没通过:{'、'.join(failed)}\n"
+            f"  修好之后重跑那一步即可(同一个 run 不必重开)—— "
+            f"每个环节只看最后一次结果。"
         )
     lack = [s for s in MACHINE_VERIFIED_STAGES if s not in stages]
     if lack:

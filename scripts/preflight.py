@@ -128,7 +128,8 @@ AMOUNT_RECONCILE_TOL = 0.05          # 5%
 
 
 def _num(value, field: str, errs: list[str], *,
-         positive: bool = True, allow_none: bool = True) -> float | None:
+         positive: bool = True, allow_none: bool = True,
+         minimum: float | None = None) -> float | None:
     """把一个字段解析成有限数,失败就记错误 —— 不抛异常。
 
     ★ 为什么不用 float() 直接转:`float("oops")` 抛 ValueError,
@@ -152,6 +153,12 @@ def _num(value, field: str, errs: list[str], *,
         return None
     if positive and f <= 0:
         errs.append(f"{field} 必须 > 0,实际 {f}")
+        return None
+    # ★ "允许 0" 和 "允许负数" 是两件事。把它们绑在一起,是为了让新标的买入
+    # (持仓 0)通过 —— 结果连 market_value = -100 也一起放行了,
+    # 而负持仓会让集中度被算低。
+    if minimum is not None and f < minimum:
+        errs.append(f"{field} 不能小于 {minimum:g},实际 {f}")
         return None
     return f
 
@@ -255,25 +262,51 @@ def validate_order(order: dict) -> list[str]:
         head, tail = key.split(".")
         src = order.get(head)
         if isinstance(src, dict) and tail in src:
-            _num(src[tail], key, errs, positive=False)
+            _num(src[tail], key, errs, positive=False, minimum=0)
     pf = order.get("portfolio")
     if isinstance(pf, dict):
         for k in ("buying_power", "total_value", "equity_value", "cash"):
             if k in pf:
-                _num(pf[k], f"portfolio.{k}", errs, positive=False)
+                # 允许 0(空账户),但负资产会让集中度/现金底线算错
+                _num(pf[k], f"portfolio.{k}", errs, positive=False, minimum=0)
     return errs
 
 
+# 每个 section 里必须是数字的字段。少验一个 section,就多一条崩溃路径 ——
+# 而在自动化链路里崩溃不等于拒绝。
+NUMERIC_CONFIG_FIELDS = {
+    "position": ("max_single_pct", "reduce_pct_warn", "residual_threshold_ratio"),
+    "cash": ("floor_pct", "bp_target_pct"),
+    "trade": ("size_std", "size_max"),
+}
+
+
 def validate_config(cfg: dict) -> list[str]:
-    """执行配置的类型校验 —— 在跑任何数值闸门之前。
+    """配置的类型校验 —— 在跑任何数值闸门之前,且覆盖**全部** section。
 
     ★ `enabled = "false"` 这种写法在 Python 里是**真**(非空字符串)。
     配置文件里一个多余的引号就能把总开关变成常开,而且没有任何提示。
+
+    ★ 只验 `[execution]` 是不够的:`position.max_single_pct = "oops"` 会让
+    集中度闸门抛 ValueError,`position = "oops"` 会抛 AttributeError ——
+    两者都是崩溃,而不是 DENY。
     """
     errs: list[str] = []
+    for name, fields in NUMERIC_CONFIG_FIELDS.items():
+        sec = cfg.get(name)
+        if sec is None:
+            continue
+        if not isinstance(sec, dict):
+            errs.append(f"[{name}] 必须是对象,实际 {type(sec).__name__}")
+            continue
+        for k in fields:
+            if k in sec:
+                _num(sec[k], f"{name}.{k}", errs, positive=False, minimum=0)
+
     ex = cfg.get("execution", {})
     if not isinstance(ex, dict):
-        return ["execution 必须是对象"]
+        errs.append("[execution] 必须是对象")
+        return errs
 
     for k in ("enabled", "dry_run", "require_confirmation"):
         if k in ex and not isinstance(ex[k], bool):

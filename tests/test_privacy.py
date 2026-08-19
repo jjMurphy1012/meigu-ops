@@ -63,7 +63,9 @@ class TestContentPatterns(unittest.TestCase):
         self.assertEqual(problems, [])
 
     def test_allows_last_four_digits(self):
-        problems = self._check_content("Agentic 子账户(后 4 位 4351)\n")
+        # 用占位后 4 位。真实账户的后 4 位同样不该进公开仓 ——
+        # 9 位扫描抓不到它,所以只能靠这里不写。
+        problems = self._check_content("Agentic 子账户(后 4 位 0000)\n")
         self.assertEqual(problems, [])
 
     def test_flags_absolute_home_path(self):
@@ -256,6 +258,52 @@ class TestCrossPlatformOutput(unittest.TestCase):
             meigu_lib._force_utf8_output()  # 不得抛异常
         finally:
             sys.stdout = saved
+
+
+class TestTestsDoNotPolluteUserLayer(unittest.TestCase):
+    """★ 跑一遍测试不该在 data/ 里留下任何文件。
+
+    2026-08-18 踩过:指纹相关的测试漏打桩 `SALT_FILE`,于是干净 clone 跑完测试
+    就多出 `data/.setup-salt`。在没有 .git 的源码压缩包里,隐私扫描会因此报错 ——
+    **测试污染用户层,等于把一个假警报塞给下一个用户。**
+    """
+
+    def test_data_dir_has_only_placeholder_after_tests(self):
+        data = ROOT / "data"
+        if not data.exists():
+            self.skipTest("没有 data/ 目录")
+        tracked_ok = {".gitkeep"}
+        # 用户自己的数据文件不在此列 —— 这条测试只关心"测试有没有制造新文件"。
+        # 所以只在 CI / 干净 clone 上严格断言(那里 data/ 除 .gitkeep 外为空)。
+        entries = {p.name for p in data.iterdir()}
+        if entries - tracked_ok - {".setup-salt"} :
+            self.skipTest("本机 data/ 有真实用户数据,跳过严格断言")
+        self.assertNotIn(".setup-salt", entries,
+                         "测试不该创建 data/.setup-salt —— 只读判定必须无副作用")
+
+    def test_readonly_state_check_creates_no_salt(self):
+        """直接验证那条不变量:只读判定不落盘。"""
+        import shutil
+        import tempfile
+
+        import setup as S
+
+        d = Path(tempfile.mkdtemp())
+        (d / "config").mkdir()
+        (d / "data").mkdir()
+        (d / "config" / "profile.toml").write_text(
+            '[account]\nid = "555000111"\n', encoding="utf-8")   # privacy-allow
+        saved = (S.CONFIG_DIR, S.DATA_DIR, S.SALT_FILE)
+        S.CONFIG_DIR, S.DATA_DIR = d / "config", d / "data"
+        S.SALT_FILE = d / "data" / ".setup-salt"
+        try:
+            S.current_account_fingerprint()          # 只读路径
+            self.assertFalse(S.SALT_FILE.exists(), "只读判定不该创建盐文件")
+            S.current_account_fingerprint(create_salt=True)   # 写入路径
+            self.assertTrue(S.SALT_FILE.exists())
+        finally:
+            S.CONFIG_DIR, S.DATA_DIR, S.SALT_FILE = saved
+            shutil.rmtree(d, ignore_errors=True)
 
 
 if __name__ == "__main__":
